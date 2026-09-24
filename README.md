@@ -315,7 +315,7 @@ Linux node.
 
 ## Status
 
-In production use for Lustre OST evacuation. The parts that talk to Lustre â€”
+In production use for Lustre OST evacuation. The parts that talk to Lustre
 layout, lease and mirror ioctls, hard-link group resolution through
 `lfs fid2path` â€” are covered by source review and the helper's offline tests,
 but cannot be exercised without a real filesystem, so they carry more risk than
