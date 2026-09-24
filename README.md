@@ -40,11 +40,11 @@ parallel_tools.py stop myjob.log
 |---|---|
 | Minimum | **3.9** |
 | In production | 3.11 |
-| Packages | none â€” standard library only |
+| Packages | none  standard library only |
 
 The syntax itself parses back to 3.7, and the only version-dependent calls are
 `os.pidfd_open` and `signal.pidfd_send_signal`, both guarded by `hasattr`. So
-it *runs* on 3.7 and 3.8 â€” but then a control signal cannot pin its target
+it *runs* on 3.7 and 3.8  but then a control signal cannot pin its target
 process, and a PID reused between check and signal would be signalled instead.
 3.9 is the lowest version where that protection exists, which is why it is the
 stated minimum.
@@ -68,13 +68,13 @@ Linux. `/proc` carries three things this program depends on:
 - running helper programs through `/proc/self/fd/N`, so that what was
   inspected is what runs;
 - checking, before a signal goes out, that the target really is the run the
-    operator meant â€” `/proc/PID/fd/2` against the log, and the script
+    operator meant  `/proc/PID/fd/2` against the log, and the script
     descriptor against this file;
 - `/proc/self/mountinfo`, which is how a `hard_link` mode is checked against
   the filesystems that are actually mounted.
 
 Without `/proc` the tool still runs, and says once per run which of these it
-had to drop. It is not a supported configuration â€” it is what happens on a
+had to drop. It is not a supported configuration  it is what happens on a
 developer's macOS machine.
 
 ### External programs
@@ -91,13 +91,13 @@ or unsafe one is reported once before any work begins.
 
 ### Without a Lustre client
 
-`copy`, `rsync` and `diff` need no Lustre at all â€” they are ordinary POSIX
+`copy`, `rsync` and `diff` need no Lustre at all  they are ordinary POSIX
 operations and work on any filesystem. What is unavailable:
 
 | | |
 |---|---|
 | `method=migrate` | Not usable. It needs the C helper, which links against `liblustreapi`, and a mounted Lustre filesystem to act on. |
-| `hard_link` = `lustre2posix`, `posix2lustre`, `lustre2lustre` | Not usable. They need `lfs` to resolve a file's names through its FID, and the mode is **refused at startup** when the mounted filesystem is not Lustre â€” rather than discovered file by file. |
+| `hard_link` = `lustre2posix`, `posix2lustre`, `lustre2lustre` | Not usable. They need `lfs` to resolve a file's names through its FID, and the mode is **refused at startup** when the mounted filesystem is not Lustre  rather than discovered file by file. |
 | `hard_link=posix2posix` | Works. Names are found by scanning the source subtree, which is slower but needs nothing from Lustre. |
 
 ### Building the C helper
@@ -117,7 +117,7 @@ make install PREFIX=/usr/local
 ```
 
 The package name is the one used on RHEL-family systems, where this is
-deployed; on other distributions it may differ â€” `make check-headers` answers
+deployed; on other distributions it may differ  `make check-headers` answers
 the question directly either way.
 
 `make test` needs the headers to compile, but **no Lustre filesystem** to run:
@@ -140,7 +140,7 @@ before letting it touch a single file.
 
 ## Two ways to start
 
-**Project shortcut** â€” creates a configuration and starts detached:
+**Project shortcut**  creates a configuration and starts detached:
 
 ```bash
 parallel_tools.py -p METHOD NAME SRC DST [INPUT] [-j N]
@@ -148,10 +148,10 @@ parallel_tools.py -p METHOD NAME SRC DST [INPUT] [-j N]
 
 It generates the file list with `find -print0`, saves it with `tee` so the
 same list can be replayed later, and writes `NAME.cfg`, `NAME.jsonlog` and
-`NAME.log`. Note that it **overwrites `NAME.cfg`** each time â€” to repeat a run
+`NAME.log`. Note that it **overwrites `NAME.cfg`** each time  to repeat a run
 with an edited configuration, use `start` instead.
 
-**Explicit configuration** â€” full control, reads paths from stdin:
+**Explicit configuration**  full control, reads paths from stdin:
 
 ```bash
 parallel_tools.py create copy copy.cfg     # write a default configuration
@@ -164,8 +164,8 @@ every key, its default, and why it is what it is.
 
 ## Controlling a running job
 
-All four take either the **stderr log** the run is writing â€” the file its own
-`2>` points at, or `NAME.log` under `-p` â€” or its PID:
+All four take either the **stderr log** the run is writing  the file its own
+`2>` points at, or `NAME.log` under `-p`  or its PID:
 
 ```bash
 parallel_tools.py stop   /srv/jobs/myjob.log    # SIGTERM
@@ -183,11 +183,11 @@ minutes:
 ```
 
 The last such line wins. What it says is a **suggestion, not an
-authorisation** â€” a log is an ordinary file, and whoever can write it can put
+authorisation**  a log is an ordinary file, and whoever can write it can put
 a wrong number in it. Before anything is sent, that PID is checked against the
 process carrying it: is its **descriptor 2 this very file**, compared by
 inode, and is it this program. Both answers come out of `/proc/PID/fd`, which
-reads the process's file table and not its memory â€” the distinction matters,
+reads the process's file table and not its memory  the distinction matters,
 because the memory of a process stuck in uninterruptible I/O cannot be read at
 all, and on a busy Lustre node that is not a rare state. A PID that fails
 either check is not signalled, and the command says which check failed.
@@ -204,20 +204,20 @@ A PID is the other way in and is never second-guessed. But it is a statement
 about the past: the log accumulates PIDs from earlier runs, and the number may
 since have been reused.
 
-- **stop** â€” workers finish the file they are on, a hard-link group is finished
+- **stop**  workers finish the file they are on, a hard-link group is finished
   as a unit, a running migrate helper is allowed to complete. Paths that have
   not started are written to `remaining_tasks_file` so the run can be resumed.
   A second stop cuts a running helper short instead of waiting.
-- **pause / resume** â€” the run stays alive with its queue and statistics. A
+- **pause / resume**  the run stays alive with its queue and statistics. A
   paused run still reacts to stop immediately; it does not have to be resumed
   first.
-- **reload** â€” re-reads the configuration. `method`, `hard_link`, `src_root`,
+- **reload**  re-reads the configuration. `method`, `hard_link`, `src_root`,
   `dst_root` and `relative_path` cannot change while a run is active;
   `max_workers` and most other values can.
 
 ## Output and exit codes
 
-`stdout` carries JSON only â€” one record per batch and one final record with
+`stdout` carries JSON only  one record per batch and one final record with
 the whole-run statistics. `stderr` carries the operational log, every line
 timestamped. Keeping them apart is what makes `jq` usable on a live run.
 
@@ -236,7 +236,7 @@ total_input_record_count = total_object_count + total_failed_count
 
 For `migrate`, the log names every file whose layout was touched but not
 finished, with a base64 copy of the path, so an input list for a repair run
-can be rebuilt byte for byte â€” including names that are not valid UTF-8.
+can be rebuilt byte for byte  including names that are not valid UTF-8.
 
 ## Deferred work
 
@@ -248,8 +248,8 @@ collected and applied at the end, in this order:
    normal batches are still running; only the reconstruction waits. On Lustre
    the names come from the file's FID via `lfs fid2path`, on POSIX from
    scanning the source subtree for the same `st_dev`/`st_ino`, which is
-   considerably slower. The `hard_link` mode names both sides â€”
-   `posix2lustre` is a POSIX source and a Lustre destination â€” and both halves
+   considerably slower. The `hard_link` mode names both sides 
+   `posix2lustre` is a POSIX source and a Lustre destination  and both halves
    are checked against the actual filesystem types before the run starts. If
    `st_nlink` says a group has more names than can be found below `src_root`,
    the whole group fails rather than being reconstructed incompletely.
@@ -265,15 +265,15 @@ when they could not be completed.
 
 The tool is routinely started as root, and the design follows from that.
 
-**Programs it executes** â€” `rsync`, `lfs`, an external copy engine, the migrate
-helper, and its own script â€” are opened **once**, judged on the resulting
+**Programs it executes**  `rsync`, `lfs`, an external copy engine, the migrate
+helper, and its own script  are opened **once**, judged on the resulting
 descriptor (regular file, executable, not group- or world-writable, owned by
 root when running as root) including the whole directory chain, and then
 executed through `/proc/self/fd/N`. What was inspected is what runs. Under
 root a program that fails these checks is **refused**, not warned about.
 
-**Files it creates itself** â€” temporary files, the directory-timestamp spill,
-the remaining-task list, generated input lists â€” are created with
+**Files it creates itself**  temporary files, the directory-timestamp spill,
+the remaining-task list, generated input lists  are created with
 `O_CREAT|O_EXCL|O_NOFOLLOW` inside a directory whose chain was checked for
 both mode and owner.
 
@@ -310,13 +310,13 @@ python3 test_passfds_invariant.py   # static: descriptor argv implies pass_fds
 
 The Python tests that need `/proc` build a stand-in from directories and
 symlinks, so they run on a developer machine too. That means they exercise the
-logic, not the kernel interface â€” the real path has to be confirmed on a
+logic, not the kernel interface the real path has to be confirmed on a
 Linux node.
 
 ## Status
 
-In production use for Lustre OST evacuation. The parts that talk to Lustre
+In production use for Lustre OST evacuation. The parts that talk to Lustre 
 layout, lease and mirror ioctls, hard-link group resolution through
-`lfs fid2path` â€” are covered by source review and the helper's offline tests,
+`lfs fid2path`  are covered by source review and the helper's offline tests,
 but cannot be exercised without a real filesystem, so they carry more risk than
 the rest. `copy`, `rsync` and `diff` are exercised end to end.
