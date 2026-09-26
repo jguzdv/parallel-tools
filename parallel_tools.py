@@ -24,6 +24,8 @@ import ctypes
 import struct
 import zlib
 import gzip
+import heapq
+import fcntl
 from collections import deque, OrderedDict
 
 try:
@@ -43,7 +45,7 @@ except ImportError:
 # Not intended for direct user invocation.
 LFS_HELPER_COMMAND = "__parallel_tools_lfs_helper__"
 
-PROGRAM_VERSION = "2.0"
+PROGRAM_VERSION = "2.1"
 
 # The C helper is the authoritative implementation of per-file Lustre
 # migration.  A null migrate_helper configuration first selects an executable
@@ -55,7 +57,7 @@ MIGRATE_HELPER_PROTOCOL_SCHEMA = 2
 # older helper carrying the same schema would be accepted although its
 # behaviour differs. Both are checked.
 MIGRATE_HELPER_PROGRAM_NAME = "lustre-migrate-file"
-MIGRATE_HELPER_MIN_VERSION = (2, 5)
+MIGRATE_HELPER_MIN_VERSION = (2, 6)
 DEFAULT_MIGRATE_ALLOCATION_ATTEMPTS = 32
 # The helper's own limits. A value the scheduler accepts and the helper then
 # refuses turns into one usage error per file, for the whole run: the
@@ -150,10 +152,12 @@ COMMON_DEFAULTS = {
     # against the current working directory. It is checked before anything is
     # written into it and created only when it is actually needed.
     "working_directory": ".parallel_tool_workdir",
-    # How much COMPRESSED directory-timestamp data is held in memory before it
-    # is spilled into working_directory. Integer bytes, or a string with a
-    # unit ("100MiB", "512KiB", "2GB").
-    "directory_times_maxsize": "100MiB",
+    # How much COMPRESSED destination metadata - what directories, and for
+    # rsync files, must carry at the end - is held in memory before it is
+    # spilled into working_directory. Integer bytes, or a string with a unit
+    # ("100MiB", "512KiB", "2GB"). The former name directory_times_maxsize is
+    # still accepted.
+    "metadata_maxsize": "100MiB",
 }
 
 DEFAULT_CONFIG_RSYNC = {
@@ -171,6 +175,10 @@ DEFAULT_CONFIG_RSYNC = {
     "sparse": False,
     "ignore_existing": False,
     "fsync": "hourly",
+    # false: a destination that could only partly be protected during the run
+    # is reported in the statistics and the log. true: it also ends the run
+    # with exit status 1.
+    "require_destination_protection": False,
     "src_root": "/src",
     "dst_root": "/dst",
 }
@@ -188,6 +196,8 @@ DEFAULT_CONFIG_COPY = {
     "sparse": False,
     "skip_existing": False,
     "fsync": "hourly",
+    # See DEFAULT_CONFIG_RSYNC.
+    "require_destination_protection": False,
     "src_root": "/src",
     "dst_root": "/dst",
 }
@@ -1908,15 +1918,24 @@ def _terminate_process_group(proc: "subprocess.Popen", reason: str) -> None:
 
 def build_rsync_parameters(cfg: dict) -> List[bytes]:
     """Build rsync arguments from independent semantic configuration flags."""
-    # -H is deliberately enabled only for a fully resolved hard-link group.
-    # Normal batches contain no preserved hard-linked files, while hard_link=null
-    # explicitly means that no hard-link discovery work should be requested.
     hardlink_group_task = bool(cfg.get("_hardlink_group_task", False))
     # -H is never used. Normal batches contain no preserved hard-linked files,
     # and a resolved group hands rsync only its primary name, so there is no
     # second name in the transfer set for rsync to link against. The aliases
     # are created and verified by parallel_tools itself.
     parameters = [b"-dlR0"]
+
+    # rsync never sets the final owner, group, mode, ACL or xattrs. Directories
+    # stay locked for the whole run and the metadata of every transferred file
+    # and symlink is recorded and applied by this program at the end, in a
+    # fixed order and after the hard-link phase. -o/-g/-p on a directory would
+    # hand it back to its final owner and mode in the middle of the run.
+    #
+    # --chmod=D0700 is the safety net for a directory rsync would create
+    # itself: without --perms it only affects NEW objects, which then start
+    # locked. Normally there are none - the parent chain of every path is
+    # created and locked by this program before rsync runs.
+    parameters.append(b"--chmod=D0700")
 
     if hardlink_group_task:
         # Force one fresh destination inode even when size and mtime already
@@ -1925,21 +1944,13 @@ def build_rsync_parameters(cfg: dict) -> List[bytes]:
         # leaving the reconstructed group with an incorrect link count.
         parameters.append(b"--ignore-times")
 
-    # One rsync flag per metadata class, matching the configured selection.
-    if permissions_mode(cfg):
-        parameters.append(b"-p")
-    if permissions_owner(cfg):
-        parameters.append(b"-o")
-    if permissions_group(cfg):
-        parameters.append(b"-g")
-
     if mtime_enabled(cfg):
-        # Without -t the destination carries the transfer time, and rsync's
-        # quick check then re-transfers every file on the next run.
+        # File times are still set by rsync at transfer time: without -t the
+        # destination carries the transfer time, and rsync's quick check then
+        # re-transfers every file on the next run. Directory times are set at
+        # the very end by this program (-O), after the last entry was written.
         parameters.append(b"-t")
-
-    if cfg.get("xattr", False):
-        parameters.append(b"-X")
+        parameters.append(b"-O")
 
     if cfg.get("sparse", False):
         # Let rsync punch holes instead of materialising runs of zero bytes.
@@ -2565,7 +2576,7 @@ def load_config_file(path: str) -> dict:
         "hard_link",
         "spill_compression",
         "working_directory",
-        "directory_times_maxsize",
+        "metadata_maxsize",
     )
 
     new_cfg = {"method": method}
@@ -2727,8 +2738,12 @@ def load_config_file(path: str) -> dict:
             data.get("fsync", defaults["fsync"])
         )
         new_cfg["copy_timeout"] = data.get("copy_timeout", defaults["copy_timeout"])
+        new_cfg["require_destination_protection"] = data.get(
+            "require_destination_protection",
+            defaults["require_destination_protection"],
+        )
 
-        boolean_keys = ["xattr", "sparse", "mtime"]
+        boolean_keys = ["xattr", "sparse", "mtime", "require_destination_protection"]
         if method == "rsync":
             boolean_keys.append("ignore_existing")
         else:
@@ -2842,8 +2857,19 @@ def load_config_file(path: str) -> dict:
         )
     if "\0" in working_directory:
         raise ValueError("working_directory must not contain a NUL character")
-    new_cfg["directory_times_maxsize"] = parse_size_bytes(
-        "directory_times_maxsize", new_cfg.get("directory_times_maxsize")
+    if "directory_times_maxsize" in data:
+        # The former name. Both at once with different values is a contradiction
+        # the operator has to resolve, not something to pick a winner for.
+        if "metadata_maxsize" in data and data["metadata_maxsize"] != data[
+            "directory_times_maxsize"
+        ]:
+            raise ValueError(
+                "metadata_maxsize and its former name directory_times_maxsize "
+                "are both set, to different values; keep metadata_maxsize"
+            )
+        new_cfg["metadata_maxsize"] = data["directory_times_maxsize"]
+    new_cfg["metadata_maxsize"] = parse_size_bytes(
+        "metadata_maxsize", new_cfg.get("metadata_maxsize")
     )
 
     # Retired. Recording is now always on for method=copy with mtime=true and
@@ -2855,7 +2881,7 @@ def load_config_file(path: str) -> dict:
         raise ValueError(
             "directory_times_file no longer exists. Directory timestamps are "
             "recorded in memory for every method=copy run with mtime=true and "
-            "only spilled to disk above directory_times_maxsize; the spill "
+            "only spilled to disk above metadata_maxsize; the spill "
             "goes into working_directory. Remove the key, and set "
             "working_directory if you want to choose where the spill lands"
         )
@@ -2913,7 +2939,7 @@ def load_config_file(path: str) -> dict:
     # A silently ignored key is indistinguishable from a working setting. A
     # misspelled "permitions" would otherwise run the whole job without
     # preserving ownership while still reporting status "ok".
-    allowed_keys = set(common_keys) | {"method"}
+    allowed_keys = set(common_keys) | {"method", "directory_times_maxsize"}
     if method == "migrate":
         allowed_keys |= {
             "stripcount", "poolname", "banned_osts", "keep_mirroring",
@@ -2924,6 +2950,7 @@ def load_config_file(path: str) -> dict:
         allowed_keys |= {
             "src_root", "dst_root", "relative_path", "xattr", "permissions",
             "mtime", "sparse", "fsync", "copy_timeout", "verify", "buffer_mb",
+            "require_destination_protection",
         }
         if method == "copy":
             allowed_keys |= {"engine", "skip_existing"}
@@ -3102,12 +3129,14 @@ def apply_new_config(new_cfg: dict) -> bool:
         # Read once when the log is built. Accepting a new value on reload and
         # logging it as applied, while the running log keeps the old one, is
         # worse than refusing the change.
-        "directory_times_maxsize",
-        # The directory-timestamp log is built at start-up from this value.
-        # Switching it on later left the run recording nothing while reporting
-        # that the new configuration had been applied, and the destination
-        # directories kept the time of their last write - with exit status 0.
+        "metadata_maxsize",
+        # The metadata classes decide what is recorded for the restore at the
+        # end. Changing them halfway would restore one part of the tree by
+        # the old rule and the rest by the new one - and a class switched on
+        # later would never be restored for what was already recorded.
         "mtime",
+        "permissions",
+        "xattr",
         # Opened once and then held as a descriptor. Changing the name while
         # files are being written into it would leave the run with state in
         # two places and nothing able to find both.
@@ -3223,6 +3252,39 @@ def validate_relative_path(rel_b: bytes, allow_root: bool = False) -> None:
     parts = rel_b.split(b"/")
     if not parts or any(p in (b"", b".", b"..") for p in parts):
         raise ValueError(f"invalid relative path: {path_display(rel_b)}")
+
+
+def count_failed_input_records(
+    paths: List[bytes], failed_files: dict, cfg: dict
+) -> int:
+    """How many INPUT RECORDS failed - not how many distinct messages there are.
+
+    failed_files maps a path to its message, which is right for display: the
+    same path has the same reason. It is wrong as a count. Two identical
+    records that both fail collapse to one key, len() says one, and the batch
+    then reports the second record as a transferred object. Reproduced with
+    two identical missing paths: 2 inputs, 1 failure, 1 object that never
+    existed - and the accounting balanced, because the phantom filled the gap.
+
+    So the records are counted, with their repetitions, against the keys the
+    batch actually used. Both spellings are accepted because the batches key
+    some failures by the normalized absolute path and some by the raw input
+    record.
+    """
+    if not failed_files:
+        return 0
+    failed = 0
+    for src_b in paths:
+        if src_b in failed_files:
+            failed += 1
+            continue
+        try:
+            _, src_abs_b, _ = normalize_input_path(src_b, cfg)
+        except Exception:
+            continue
+        if src_abs_b in failed_files:
+            failed += 1
+    return failed
 
 
 def normalize_input_path(path_b: bytes, cfg: dict) -> Tuple[bytes, bytes, bytes]:
@@ -4774,6 +4836,114 @@ def copy_xattrs_at(
             )
 
 
+def prelock_batch(paths, cfg: dict) -> None:
+    """Lock the existing parent directories of a batch with one journal flush.
+
+    Without this every existing directory costs its own durable journal
+    write when the walk first reaches it. Best effort: whatever cannot be
+    resolved here is left to the ordinary walk, which locks it itself.
+    """
+    guard = destination_guard
+    if guard is None:
+        return
+    rel_dirs = set()
+    for path_b in paths:
+        try:
+            rel_b, _src_abs_b, _dst_b = normalize_input_path(path_b, cfg)
+        except Exception:
+            continue
+        if isinstance(rel_b, str):
+            rel_b = os.fsencode(rel_b)
+        if rel_b != b".":
+            rel_dirs.add(os.path.dirname(rel_b))
+    if not rel_dirs:
+        return
+    try:
+        guard.prelock(rel_dirs)
+    except Exception as exc:
+        log(f"WARNING: prelocking the batch directories failed, locking one by one: {exc}")
+
+
+def open_destination_root(dst_root_b: bytes) -> int:
+    """A descriptor for dst_root: the held one when the run guards it."""
+    guard = destination_guard
+    if guard is not None and os.path.normpath(dst_root_b) == guard.dst_root_b:
+        return guard.open_root()
+    return open_dir_fd_componentwise(dst_root_b, create=True)
+
+
+def prepare_destination_directory(
+    dst_parent_fd: int,
+    name_b: bytes,
+    rel_b: bytes,
+    src_st,
+    src_fd: Optional[int],
+    cfg: Optional[dict],
+) -> Tuple[int, bool]:
+    """Create or open one destination directory, locked, and record it.
+
+    A new directory is created 0700 and is therefore locked from its first
+    moment; an existing one is locked here, with its original values recorded
+    and journalled first. Nothing of the directory's final metadata is applied
+    now - owner, mode, ACL, xattrs and times are recorded and set by the
+    restore at the end, bottom-up, when nothing writes into the tree any more.
+
+    Returns (fd, created). The caller owns the descriptor.
+    """
+    created = False
+    dst_st = None
+    try:
+        os.mkdir(name_b, DESTINATION_LOCK_PERMISSIONS, dir_fd=dst_parent_fd)
+        created = True
+    except FileExistsError:
+        dst_st = os.stat(name_b, dir_fd=dst_parent_fd, follow_symlinks=False)
+        if not stat.S_ISDIR(dst_st.st_mode):
+            raise NotADirectoryError(
+                errno.ENOTDIR,
+                f"destination path component is not a directory: "
+                f"{path_display(name_b)}",
+            )
+
+    fd = os.open(
+        name_b,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+        dir_fd=dst_parent_fd,
+    )
+    try:
+        if dst_st is not None:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (dst_st.st_dev, dst_st.st_ino):
+                raise OSError(
+                    errno.ESTALE, "destination directory changed while opening it"
+                )
+
+        guard = destination_guard
+        if guard is None:
+            # Nothing guards this tree (a caller outside a copy or rsync run):
+            # the metadata is applied at once, as it always was.
+            if cfg is not None and preserves_any_metadata(cfg) and created:
+                apply_metadata_fd(fd, src_st, cfg)
+            if created and (cfg is None or not permissions_mode(cfg)):
+                os.fchmod(fd, 0o777 & ~get_process_umask())
+            return fd, created
+
+        locked = guard.lock_directory(fd, rel_b)
+        record_directory_final(
+            rel_b, src_st, src_fd, cfg if cfg is not None else get_config_snapshot(),
+            created, locked,
+        )
+        # Only fsync="file" pays for durability of a directory entry.
+        if created and cfg is not None and fsync_per_file(cfg):
+            try:
+                os.fsync(fd)
+            except OSError:
+                pass
+        return fd, created
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def open_src_and_dst_dir_fds(
     src_root_b: bytes,
     dst_root_b: bytes,
@@ -4783,8 +4953,12 @@ def open_src_and_dst_dir_fds(
 ) -> Tuple[int, int]:
     """
     Open/create dst_root/rel_parent_b component-by-component.
-    For every destination subdirectory, synchronize requested xattrs from the
-    corresponding source directory src_root/rel_parent_b.
+
+    Every destination directory on the way is locked and recorded by
+    prepare_destination_directory(); its final metadata, xattrs included, is
+    applied by the restore at the end of the run. xattr_copy is kept for the
+    callers' signature and decides nothing here any more: whether xattrs are
+    recorded follows the configuration.
 
     Source and destination are walked once in lockstep and BOTH resulting
     parent fds are returned, because the source chain has to be opened anyway
@@ -4808,7 +4982,7 @@ def open_src_and_dst_dir_fds(
 
     try:
         src_fd = open_dir_fd_componentwise(src_root_b, create=False)
-        dst_fd = open_dir_fd_componentwise(dst_root_b, create=True)
+        dst_fd = open_destination_root(dst_root_b)
         parts = [p for p in rel_parent_b.split(b"/") if p and p != b"."]
         walked_rel_b = b""
 
@@ -4827,82 +5001,9 @@ def open_src_and_dst_dir_fds(
                     dir_fd=src_fd,
                 )
                 src_st = os.fstat(next_src_fd)
-
-                created = False
-                try:
-                    # Created restrictively and widened afterwards, so a
-                    # directory is never briefly more permissive than its
-                    # source while entries are being added to it.
-                    os.mkdir(part, 0o700, dir_fd=dst_fd)
-                    created = True
-                except FileExistsError:
-                    dst_st = os.stat(part, dir_fd=dst_fd, follow_symlinks=False)
-                    if not stat.S_ISDIR(dst_st.st_mode):
-                        raise NotADirectoryError(
-                            errno.ENOTDIR,
-                            f"destination path component is not a directory: "
-                            f"{path_display(part)}",
-                        )
-
-                dst_open_flags = (
-                    os.O_RDONLY
-                    | os.O_DIRECTORY
-                    | getattr(os, "O_NOFOLLOW", 0)
+                next_dst_fd, _created = prepare_destination_directory(
+                    dst_fd, part, walked_rel_b, src_st, next_src_fd, metadata_cfg
                 )
-                next_dst_fd = os.open(part, dst_open_flags, dir_fd=dst_fd)
-                if not created:
-                    opened_dst = os.fstat(next_dst_fd)
-                    if (opened_dst.st_dev, opened_dst.st_ino) != (
-                        dst_st.st_dev, dst_st.st_ino
-                    ):
-                        raise OSError(
-                            errno.ESTALE,
-                            "destination directory changed while opening it",
-                        )
-
-                if created:
-                    # metadata_cfg is the whole configuration, not only the
-                    # metadata classes: whether anything is preserved is asked
-                    # here, so that an unrelated setting such as the fsync mode
-                    # below stays readable even when no class is selected.
-                    apply_any_metadata = (
-                        metadata_cfg is not None
-                        and preserves_any_metadata(metadata_cfg)
-                    )
-                    if apply_any_metadata:
-                        # Uniform rule for every directory, leaf or
-                        # intermediate: changing ownership needs privileges and
-                        # is therefore tolerated when refused, while a failing
-                        # chmod or utime is a real metadata loss and must be
-                        # reported.
-                        apply_metadata_fd(next_dst_fd, src_st, metadata_cfg)
-                    if not apply_any_metadata or not permissions_mode(metadata_cfg):
-                        # No mode requested: fall back to the usual umask
-                        # semantics instead of leaving the 0o700 of mkdir.
-                        os.fchmod(next_dst_fd, 0o777 & ~get_process_umask())
-
-                # Whether this run created the directory or found one from an
-                # earlier run, every file written into it resets its mtime.
-                # Recording only the created ones left a resumed run with
-                # destination directories that nothing ever repaired.
-                if metadata_cfg is not None and mtime_enabled(metadata_cfg):
-                    record_directory_times(walked_rel_b, src_st)
-
-                if xattr_copy:
-                    copy_xattrs_fd(
-                        next_src_fd, next_dst_fd, prune_extra=True
-                    )
-
-                # Only fsync="file" pays for durability of a directory
-                # entry. metadata_cfg is None when no metadata class is
-                # configured at all, which says nothing about the fsync mode
-                # and must not silently turn the flush back on.
-                if created and metadata_cfg is not None and fsync_per_file(metadata_cfg):
-                    try:
-                        os.fsync(next_dst_fd)
-                    except OSError:
-                        pass
-
             except Exception:
                 if next_src_fd is not None:
                     try:
@@ -5074,72 +5175,312 @@ class DiffParentDirFdCache:
             ParentDirFdCache._close_pair(fds)
 
 
-class DirectoryTimesLog:
-    """Append-only log of destination directories whose timestamps must be
-    restored after all files have been written.
+# ------------------------------------------------------------
+# Destination metadata: protection during the run, restore at the end
+# ------------------------------------------------------------
+#
+# copy and rsync write into destination directories that are LOCKED for the
+# whole run: owned by the user running this program, no permissions for group
+# or other. Nobody else can then reach anything below a locked dst_root by
+# path, whatever the final permissions of the tree are going to be. Every
+# metadata value a directory must carry in the end - and for rsync also the
+# owner, mode, ACL and xattrs of files and symlinks - is recorded instead of
+# being applied, and applied once, after all batches and the hard-link phase.
+#
+# One logical entry is "path -> {the metadata to set at the end}". The keys
+# that are present ARE the fields; there is no field mask. A missing key means
+# "leave as it is", while for example acl_access=None means "remove the ACL".
+#
+# Two kinds of records keep source values and original destination values
+# apart:
+#
+#   FINAL  the value the configured metadata classes ask for, taken from the
+#          source. Recorded whenever the object is met; the last one wins.
+#   ORIG   the value a pre-existing destination directory had before the lock
+#          changed it. Recorded only at the moment the lock actually changes
+#          a field, which happens once: a later batch finds the directory
+#          already locked, changes nothing and therefore records nothing - it
+#          can never store the temporary 0700 as the original. The first one
+#          wins.
+#
+# At restore time a FINAL value overrides an ORIG value of the same field.
+#
+# Record layout, all lengths as unsigned LEB128 varints:
+#
+#   len(body) body
+#   body = len(path) path, u8 kind, u8 origin, { u8 key, len(value)+1 value }*
+#
+# A value length of 0 encodes None. Integers are varints, times are two
+# little-endian int64 nanosecond values, xattrs a sequence of
+# len(name) name len(value) value.
 
-    Directory timestamps cannot be finalised while the copy runs: creating an
-    entry inside a directory sets that directory's mtime to the current time
-    again, so every value written during the copy is overwritten by the next
-    file. The correct source values are therefore recorded here and applied
-    once, after the normal phase and the hard-link phase have finished.
+META_KIND_DIR = 1
+META_KIND_FILE = 2
+META_KIND_SYMLINK = 3
+META_ORIGIN_FINAL = 1
+META_ORIGIN_ORIG = 2
 
-    The log is written once and replayed exactly once, in write order, and is
-    never searched. It is therefore an append-only stream rather than a table:
-    a directory recorded twice simply has utimensat applied twice and the last
-    record wins, exactly as a dictionary would. That is what keeps both the
-    collecting and the replaying side at constant memory, independent of the
-    number of directories.
+_META_KEYS = {
+    "uid": 1,
+    "gid": 2,
+    "mode": 3,
+    "acl_access": 4,
+    "acl_default": 5,
+    "xattrs": 6,
+    "times": 7,
+    # Present when the run locked (or created locked) this directory. At the
+    # restore the directory must still be locked; if it is not, somebody or
+    # something released it during the run.
+    "locked": 8,
+    # ORIG records only: (st_dev, st_ino) of the directory whose original
+    # values they are. Checked before anything is rolled back, never applied.
+    "identity": 9,
+}
+_META_KEY_NAMES = {number: name for name, number in _META_KEYS.items()}
+_META_INT_KEYS = frozenset(("uid", "gid", "mode"))
+_META_TIMES = struct.Struct("<qq")
+# A single record can never be larger than this. The limit exists so a corrupt
+# stream cannot make a reader buffer without bound.
+META_MAX_RECORD = 16 * 1024 * 1024
 
-    Record layout: int64 atime_ns, int64 mtime_ns, relative path, NUL. Only the
-    path may contain arbitrary bytes and it cannot contain NUL, so the search
-    for the terminator starts after the fixed-size header.
+ACL_ACCESS_XATTR = "system.posix_acl_access"
+ACL_DEFAULT_XATTR = "system.posix_acl_default"
+_ACL_FIELDS = (("acl_access", ACL_ACCESS_XATTR), ("acl_default", ACL_DEFAULT_XATTR))
+_ACL_XATTR_NAMES = frozenset((ACL_ACCESS_XATTR, ACL_DEFAULT_XATTR))
 
-    Reopening an existing log appends a new compressed member. Both gzip and
-    zstd define concatenated members/frames as valid, so a resumed run extends
-    the same file and the replay reads all parts.
+# The lock: owner rwx, nothing for group and other. Special bits are kept,
+# they grant nobody access.
+DESTINATION_LOCK_PERMISSIONS = 0o700
+
+
+def _put_varint(out: bytearray, value: int) -> None:
+    value = int(value)
+    if value < 0:
+        raise ValueError(f"negative value cannot be stored as varint: {value}")
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return
+
+
+def _try_varint(buf, pos: int) -> Tuple[Optional[int], int]:
+    """Decode one varint; (None, pos) when the buffer ends inside it."""
+    shift = 0
+    value = 0
+    while True:
+        if pos >= len(buf):
+            return None, pos
+        byte = buf[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, pos
+        shift += 7
+        if shift > 63:
+            raise ValueError("corrupt metadata record: varint too long")
+
+
+def _get_varint(buf, pos: int) -> Tuple[int, int]:
+    value, pos = _try_varint(buf, pos)
+    if value is None:
+        raise ValueError("corrupt metadata record: truncated varint")
+    return value, pos
+
+
+def _encode_meta_value(key: str, value) -> Optional[bytes]:
+    if value is None:
+        return None
+    if key in _META_INT_KEYS:
+        out = bytearray()
+        _put_varint(out, value)
+        return bytes(out)
+    if key == "times":
+        return _META_TIMES.pack(int(value[0]), int(value[1]))
+    if key == "locked":
+        return b""
+    if key == "identity":
+        out = bytearray()
+        _put_varint(out, value[0])
+        _put_varint(out, value[1])
+        return bytes(out)
+    if key == "xattrs":
+        out = bytearray()
+        for name in sorted(value):
+            name_b = os.fsencode(name)
+            value_b = bytes(value[name])
+            _put_varint(out, len(name_b))
+            out += name_b
+            _put_varint(out, len(value_b))
+            out += value_b
+        return bytes(out)
+    return bytes(value)
+
+
+def _decode_meta_value(key: str, raw: Optional[bytes]):
+    if raw is None:
+        return None
+    if key in _META_INT_KEYS:
+        value, pos = _get_varint(raw, 0)
+        if pos != len(raw):
+            raise ValueError(f"corrupt metadata record: trailing bytes in {key}")
+        return value
+    if key == "times":
+        if len(raw) != _META_TIMES.size:
+            raise ValueError("corrupt metadata record: bad times field")
+        return _META_TIMES.unpack(raw)
+    if key == "locked":
+        return True
+    if key == "identity":
+        device, pos = _get_varint(raw, 0)
+        inode, pos = _get_varint(raw, pos)
+        if pos != len(raw):
+            raise ValueError("corrupt metadata record: bad identity field")
+        return (device, inode)
+    if key == "xattrs":
+        result = {}
+        pos = 0
+        while pos < len(raw):
+            length, pos = _get_varint(raw, pos)
+            name_b = raw[pos:pos + length]
+            pos += length
+            length, pos = _get_varint(raw, pos)
+            value_b = raw[pos:pos + length]
+            pos += length
+            if pos > len(raw):
+                raise ValueError("corrupt metadata record: bad xattrs field")
+            result[name_b] = value_b
+        return result
+    return raw
+
+
+def encode_meta_record(path_b: bytes, kind: int, origin: int, fields: dict) -> bytes:
+    """One length-prefixed record: path -> fields."""
+    body = bytearray()
+    _put_varint(body, len(path_b))
+    body += path_b
+    body.append(kind)
+    body.append(origin)
+    for key in sorted(fields, key=_META_KEYS.__getitem__):
+        raw = _encode_meta_value(key, fields[key])
+        body.append(_META_KEYS[key])
+        if raw is None:
+            _put_varint(body, 0)
+        else:
+            _put_varint(body, len(raw) + 1)
+            body += raw
+    if len(body) > META_MAX_RECORD:
+        raise ValueError(
+            f"metadata record for {path_display(path_b)} exceeds "
+            f"{META_MAX_RECORD} bytes"
+        )
+    out = bytearray()
+    _put_varint(out, len(body))
+    out += body
+    return bytes(out)
+
+
+def meta_body_path(body: bytes) -> bytes:
+    length, pos = _get_varint(body, 0)
+    if pos + length > len(body):
+        raise ValueError("corrupt metadata record: path runs past the record")
+    return bytes(body[pos:pos + length])
+
+
+def decode_meta_body(body: bytes) -> Tuple[bytes, int, int, dict]:
+    length, pos = _get_varint(body, 0)
+    path_b = bytes(body[pos:pos + length])
+    pos += length
+    if pos + 2 > len(body):
+        raise ValueError("corrupt metadata record: missing kind/origin")
+    kind = body[pos]
+    origin = body[pos + 1]
+    pos += 2
+    fields = {}
+    while pos < len(body):
+        key = _META_KEY_NAMES.get(body[pos])
+        if key is None:
+            raise ValueError(f"corrupt metadata record: unknown key {body[pos]}")
+        pos += 1
+        length, pos = _get_varint(body, pos)
+        if length == 0:
+            raw = None
+        else:
+            raw = bytes(body[pos:pos + length - 1])
+            pos += length - 1
+            if pos > len(body):
+                raise ValueError("corrupt metadata record: value runs past the record")
+        fields[key] = _decode_meta_value(key, raw)
+    return path_b, kind, origin, fields
+
+
+def iter_meta_bodies(chunks, label: str, tolerate_truncated_tail: bool = False):
+    """Split a stream of length-prefixed records into record bodies."""
+    pending = b""
+    for chunk in chunks:
+        pending = pending + chunk if pending else bytes(chunk)
+        pos = 0
+        while True:
+            length, start = _try_varint(pending, pos)
+            if length is None:
+                break
+            if length > META_MAX_RECORD:
+                raise ValueError(
+                    f"corrupt metadata log {label}: record of {length} bytes"
+                )
+            if start + length > len(pending):
+                break
+            yield pending[start:start + length]
+            pos = start + length
+        pending = pending[pos:]
+    if pending and not tolerate_truncated_tail:
+        # Dropping it silently would leave exactly the objects unrestored
+        # whose loss the record count in the log would not reveal.
+        raise ValueError(
+            f"metadata log {label} ends inside a record; {len(pending)} "
+            f"trailing bytes are not a complete entry"
+        )
+
+
+class MetadataLog:
+    """Append-only, compressed log of metadata records, spilled when large.
+
+    Held in memory first; a tree small enough to fit leaves nothing behind.
+    The limit is measured on the COMPRESSED bytes, because that is what is
+    actually held. Above it the whole stream moves into a file created in the
+    working directory, and recording goes on there.
+
+    This is not a crash-safe journal. It exists so that the restore at the end
+    of a run knows what to do; a process that dies takes the in-memory part
+    with it. What must survive a crash - the original values of destination
+    directories the lock changed - goes through DestinationJournal as well.
     """
 
-    RECORD_HEADER = struct.Struct("<qq")
-
-    # The file outlives the run that wrote it and is read back by a different
-    # invocation, so it carries a plain-text header naming what it is: without
-    # it, a log written with another compression, for another destination tree
-    # or by another version is read as if it belonged to this run.
-    FILE_MAGIC = b"parallel_tools-directory-times\n"
+    FILE_MAGIC = b"parallel_tools-destination-metadata\n"
     FILE_FORMAT_VERSION = 1
-    # A record path can never be longer than this. The limit exists so a
-    # corrupt stream cannot make the replay buffer without bound while it
-    # searches for a terminator that will never come.
-    MAX_RECORD_PATH = 1 << 16
 
     def __init__(
         self,
         maxsize: int,
         compression: str = "zlib",
         dst_root: Optional[str] = None,
+        label: str = "dstmeta",
     ) -> None:
         self.maxsize = max(1, int(maxsize))
         self.compression = compression
         self.dst_root = dst_root
+        self.label = label
         self.lock = threading.Lock()
         self.record_count = 0
         self.closed = False
-        self.resumed = False
-
-        # Memory first. A tree small enough to fit leaves nothing behind at
-        # all, which is the point: the repair should not depend on the
-        # operator having configured a file for a case that usually does not
-        # arise. The limit is measured on the COMPRESSED bytes, because that
-        # is what is actually held.
         self.buffer = bytearray()
         # A compressor does not hand out every byte it is given: deflate
         # accumulates roughly a window's worth of input before it emits
-        # anything. Counting only what came out would therefore measure a
-        # buffer that stays at ten bytes while tens of kilobytes sit inside
-        # the codec, and a small limit would never be reached at all. Input
-        # fed since the last emission is an exact upper bound on what is held
-        # in there, so the two together are what "size" means here.
+        # anything. Input fed since the last emission is an exact upper bound
+        # on what is held in there, so the two together are what "size" means.
         self.pending_input = 0
         self.stream = None
         self.path = None
@@ -5147,33 +5488,49 @@ class DirectoryTimesLog:
         self.identity = None
         self.header_size = 0
         # Set when a spill was needed and could not be done. Recording stops
-        # there: growing without bound would trade a wrong timestamp for a
-        # dead machine. What is already buffered is still replayed.
+        # there: growing without bound would trade wrong metadata for a dead
+        # machine. What is already held is still restored.
         self.spill_refused = False
-
         self.compressor = self._make_compressor()
 
+    def _make_compressor(self):
+        if self.compression == "zlib":
+            # Level 1: measured 6x smaller at 185 MB/s. The gzip container
+            # keeps a spilled file zcat-readable.
+            return zlib.compressobj(1, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
+        if self.compression == "zstd":
+            return zstandard.ZstdCompressor(level=1).compressobj()
+        return None
+
+    def _header_bytes(self) -> bytes:
+        payload = json.dumps(
+            {
+                "version": self.FILE_FORMAT_VERSION,
+                "program_version": PROGRAM_VERSION,
+                "compression": self.compression,
+                "dst_root": self.dst_root,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("ascii")
+        return self.FILE_MAGIC + payload + b"\n"
+
     def _spill_locked(self) -> bool:
-        """Move the buffer into a file. The lock is already held."""
         fd = working_directory_fd()
         if fd < 0:
             self.spill_refused = True
-            directory_times_incomplete.set()
+            metadata_restore_incomplete.set()
             log(
-                f"WARNING: directory timestamps exceed "
-                f"directory_times_maxsize={self.maxsize} bytes and there is no "
-                f"usable working directory to spill into "
-                f"({working_directory_problem()}). Recording stops here; the "
-                f"{self.record_count} directories already held are still "
-                f"repaired, the rest keep the time of their last write"
+                f"WARNING: destination metadata exceeds metadata_maxsize="
+                f"{self.maxsize} bytes and there is no usable working "
+                f"directory to spill into ({working_directory_problem()}). "
+                f"Recording stops here; the {self.record_count} records "
+                f"already held are still restored, later objects are not"
             )
             return False
 
-        name = run_state_name("mtdirs", ".log")
+        name = run_state_name(self.label, ".log")
         try:
-            # O_EXCL and O_NOFOLLOW through the directory descriptor: the name
-            # is new, nothing can be waiting under it, and no path is resolved
-            # a second time.
             descriptor = os.open(
                 name,
                 os.O_WRONLY | os.O_CREAT | os.O_EXCL
@@ -5183,8 +5540,8 @@ class DirectoryTimesLog:
             )
         except OSError as exc:
             self.spill_refused = True
-            directory_times_incomplete.set()
-            log(f"WARNING: cannot create the directory timestamp spill: {exc}")
+            metadata_restore_incomplete.set()
+            log(f"WARNING: cannot create the destination metadata spill: {exc}")
             return False
 
         try:
@@ -5195,116 +5552,33 @@ class DirectoryTimesLog:
         except BaseException:
             os.close(descriptor)
             self.spill_refused = True
-            directory_times_incomplete.set()
+            metadata_restore_incomplete.set()
             raise
 
         self.name = name
         self.path = os.path.join(working_directory_display(), name)
-        # Header first, then everything compressed so far. The compressor is
-        # not restarted, so the file holds one continuous stream.
-        self.header_size = self._write_header()
+        header = self._header_bytes()
+        self.stream.write(header)
+        self.header_size = len(header)
         self.stream.write(bytes(self.buffer))
         held = len(self.buffer) + self.pending_input
         self.buffer = bytearray()
         self.pending_input = 0
         log(
-            f"directory timestamps: {held} compressed bytes over "
-            f"{self.record_count} directories reached "
-            f"directory_times_maxsize; spilled to {self.path}"
+            f"destination metadata: {held} compressed bytes over "
+            f"{self.record_count} records reached metadata_maxsize; spilled "
+            f"to {self.path}"
         )
         return True
 
-    def _header_bytes(self) -> bytes:
-        payload = json.dumps(
-            {
-                "version": self.FILE_FORMAT_VERSION,
-                "program_version": PROGRAM_VERSION,
-                "compression": self.compression,
-                "dst_root": self.dst_root,
-                "record_header": self.RECORD_HEADER.format,
-            },
-            ensure_ascii=True,
-            sort_keys=True,
-        ).encode("ascii")
-        return self.FILE_MAGIC + payload + b"\n"
-
-    def _write_header(self) -> int:
-        header = self._header_bytes()
-        self.stream.write(header)
-        self.stream.flush()
-        return len(header)
-
-    def _verify_header(self) -> int:
-        """Read the header of an existing log and refuse a foreign one."""
-        descriptor = os.open(os.fsencode(self.path), os.O_RDONLY | os.O_NOFOLLOW)
-        try:
-            reopened = os.fstat(descriptor)
-            if (int(reopened.st_dev), int(reopened.st_ino)) != self.identity:
-                raise ValueError(
-                    f"directory timestamp log was replaced while it was being "
-                    f"opened: {self.path}"
-                )
-            raw = os.read(descriptor, 64 * 1024)
-        finally:
-            os.close(descriptor)
-
-        if not raw.startswith(self.FILE_MAGIC):
-            raise ValueError(
-                f"{self.path} exists and is not a directory timestamp log; "
-                f"refusing to append to it"
-            )
-        end = raw.find(b"\n", len(self.FILE_MAGIC))
-        if end < 0:
-            raise ValueError(f"truncated header in {self.path}")
-        try:
-            header = json.loads(raw[len(self.FILE_MAGIC):end].decode("ascii"))
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise ValueError(f"unreadable header in {self.path}: {exc}") from exc
-
-        if header.get("version") != self.FILE_FORMAT_VERSION:
-            raise ValueError(
-                f"{self.path} was written in format version "
-                f"{header.get('version')!r}, this program writes version "
-                f"{self.FILE_FORMAT_VERSION}"
-            )
-        if header.get("compression") != self.compression:
-            raise ValueError(
-                f"{self.path} was written with spill_compression="
-                f"{header.get('compression')!r} and cannot be continued with "
-                f"{self.compression!r}"
-            )
-        if self.dst_root is not None and header.get("dst_root") not in (
-            None,
-            self.dst_root,
-        ):
-            raise ValueError(
-                f"{self.path} belongs to dst_root={header.get('dst_root')!r}, "
-                f"not to {self.dst_root!r}"
-            )
-        return end + 1
-
-    def _make_compressor(self):
-        if self.compression == "zlib":
-            # Level 1: measured 6x smaller at 185 MB/s. Level 6 is 5% smaller
-            # for less than half the throughput, which a write-once log does
-            # not justify. The gzip container keeps the file zcat-readable.
-            return zlib.compressobj(1, zlib.DEFLATED, 16 + zlib.MAX_WBITS)
-        if self.compression == "zstd":
-            return zstandard.ZstdCompressor(level=1).compressobj()
-        return None
-
-    def record(self, rel_dir_b: bytes, atime_ns: int, mtime_ns: int) -> None:
-        if not rel_dir_b or rel_dir_b == b".":
-            return
-
-        payload = (
-            self.RECORD_HEADER.pack(int(atime_ns), int(mtime_ns))
-            + rel_dir_b
-            + b"\0"
-        )
+    def record_raw(self, record: bytes) -> None:
+        """Append one already encoded, length-prefixed record."""
         with self.lock:
             if self.closed or self.spill_refused:
+                if self.closed:
+                    raise RuntimeError(f"{self.label} log is already closed")
                 return
+            payload = record
             if self.compressor is not None:
                 compressed = self.compressor.compress(payload)
                 if compressed:
@@ -5324,6 +5598,9 @@ class DirectoryTimesLog:
             ):
                 self._spill_locked()
 
+    def record_entry(self, path_b: bytes, kind: int, origin: int, fields: dict) -> None:
+        self.record_raw(encode_meta_record(path_b, kind, origin, fields))
+
     def close(self) -> None:
         with self.lock:
             if self.closed:
@@ -5331,19 +5608,17 @@ class DirectoryTimesLog:
             self.closed = True
             tail = self.compressor.flush() if self.compressor is not None else b""
             if self.stream is None:
-                # Never spilled: the whole log is the buffer, and the tail of
-                # the compressed stream belongs at its end.
                 if tail:
                     self.buffer += tail
                 return
             if tail:
                 self.stream.write(tail)
             self.stream.flush()
-            os.fsync(self.stream.fileno())
             self.stream.close()
 
     def discard(self) -> None:
         """Remove the spilled file, if there is one."""
+        self.buffer = bytearray()
         if not self.name:
             return
         fd = working_directory_fd()
@@ -5354,7 +5629,7 @@ class DirectoryTimesLog:
         except OSError:
             pass
 
-    def _reader_for(self, stream, chunk_size: int):
+    def _reader_for(self, stream):
         if self.compression == "none":
             return stream
         if self.compression == "zstd":
@@ -5364,143 +5639,1127 @@ class DirectoryTimesLog:
         return gzip.GzipFile(fileobj=stream, mode="rb")
 
     def _iter_raw_chunks(self, chunk_size: int = 1024 * 1024):
-        if self.stream is None and self.name is None:
-            # Never spilled: replay straight out of memory. Same bytes, same
-            # framing, so the record loop below does not know the difference.
-            source = io.BytesIO(bytes(self.buffer))
-            reader = self._reader_for(source, chunk_size)
+        if self.name is None:
+            reader = self._reader_for(io.BytesIO(bytes(self.buffer)))
             while True:
                 chunk = reader.read(chunk_size)
                 if not chunk:
                     return
                 yield chunk
-            return
 
-        descriptor = os.open(os.fsencode(self.path), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = working_directory_fd()
+        if fd < 0:
+            raise RuntimeError(
+                f"the working directory holding {self.path} is gone"
+            )
+        descriptor = os.open(
+            self.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+            dir_fd=fd,
+        )
         try:
             reopened = os.fstat(descriptor)
             if (int(reopened.st_dev), int(reopened.st_ino)) != self.identity:
                 raise RuntimeError(
-                    f"directory timestamp log was replaced between writing and "
-                    f"reading: {self.path}"
+                    f"destination metadata log was replaced between writing "
+                    f"and reading: {self.path}"
                 )
         except BaseException:
             os.close(descriptor)
             raise
-
         with open(descriptor, "rb", buffering=chunk_size, closefd=True) as stream:
-            # The header is plain text in front of the compressed members.
-            header_size = getattr(self, "header_size", 0)
-            if header_size:
-                stream.seek(header_size)
-            reader = self._reader_for(stream, chunk_size)
-
+            stream.seek(self.header_size)
+            reader = self._reader_for(stream)
             while True:
                 chunk = reader.read(chunk_size)
                 if not chunk:
                     return
                 yield chunk
 
-    def replay(self):
-        """Yield (rel_dir_b, atime_ns, mtime_ns) in write order, streaming."""
-        record_header = self.RECORD_HEADER.size
-        pending = b""
-
-        for chunk in self._iter_raw_chunks():
-            pending = pending + chunk if pending else chunk
-            position = 0
-            while len(pending) - position >= record_header:
-                # The record header may itself contain NUL bytes, so the
-                # terminator is searched for only behind it.
-                terminator = pending.find(b"\0", position + record_header)
-                if terminator < 0:
-                    if len(pending) - position - record_header > self.MAX_RECORD_PATH:
-                        raise ValueError(
-                            f"corrupt directory timestamp log {self.path}: no "
-                            f"record terminator within "
-                            f"{self.MAX_RECORD_PATH} bytes"
-                        )
-                    break
-                atime_ns, mtime_ns = self.RECORD_HEADER.unpack_from(
-                    pending, position
-                )
-                yield pending[position + record_header:terminator], atime_ns, mtime_ns
-                position = terminator + 1
-            pending = pending[position:]
-
-        # Anything left over is the beginning of a record whose terminator
-        # never arrived, so the file ends in the middle of one. Dropping it
-        # silently would leave exactly the directories unrepaired whose loss
-        # the count in the log would not reveal.
-        if pending:
-            raise ValueError(
-                f"directory timestamp log {self.path} ends inside a record; "
-                f"{len(pending)} trailing bytes are not a complete entry"
-            )
+    def bodies(self):
+        """Yield record bodies in write order, streaming."""
+        yield from iter_meta_bodies(
+            self._iter_raw_chunks(), self.path or f"<{self.label} in memory>"
+        )
 
 
-directory_times_log: Optional[DirectoryTimesLog] = None
-directory_times_incomplete = threading.Event()
-# Set when the ONLY reason the timestamps were not applied is that the run was
-# stopped before it got that far. That is a consequence of the operator's own
-# instruction, not a failure, and it must not turn the documented "2 - stopped,
-# resume it" into "1 - something went wrong". A genuine failure - a record that
-# could not be written, a spill that could not be made, a repair that failed -
-# sets only directory_times_incomplete and keeps the 1.
-directory_times_deferred_by_stop = threading.Event()
+class DestinationJournal:
+    """Write-ahead journal of original destination values changed by the lock.
 
+    The MetadataLog alone is not crash-safe: after a killed process the
+    original owner and mode of a pre-existing directory that was locked would
+    be lost, and the directory would stay 0700 for good. Every ORIG record is
+    therefore made durable HERE before the change it describes is made.
 
-def record_directory_times(rel_dir_b: bytes, src_st) -> None:
-    """Note one destination directory for the final timestamp repair."""
-    log_object = directory_times_log
-    if log_object is None:
-        return
-    try:
-        log_object.record(rel_dir_b, src_st.st_atime_ns, src_st.st_mtime_ns)
-    except Exception as exc:
-        # Losing a record silently would produce a destination with wrong
-        # directory timestamps that still reports success.
-        if not directory_times_incomplete.is_set():
-            log(f"WARNING: cannot record directory timestamps: {exc}")
-        directory_times_incomplete.set()
+    Writes are group-committed: whoever finds no fsync in progress performs
+    one for everything written so far, everybody else waits for it. There is
+    no timer; concurrent lockers share an fsync naturally, and a single one
+    pays exactly one.
 
-
-class _DirectoryTimeApplier:
-    """Applies recorded timestamps, reusing parent directory fds.
-
-    One instance per repair thread, so the fd cache is never shared and needs
-    no locking. Errors are counted rather than raised: a repair thread must
-    keep draining its queue, otherwise the reader would block on a full one.
+    The name is fixed per dst_root, so the next start finds the journal of a
+    run that died and rolls the originals back before it locks anything.
+    Only ORIG records are journalled. They are rare - a destination directory
+    is changed once, when it already existed - so a fresh copy pays nothing.
     """
 
-    def __init__(self, dst_root_b: bytes, max_parent_entries: int = 64) -> None:
+    MAGIC = b"parallel_tools-destination-journal\n"
+    # 2: the header names the identity of dst_root, and every record the
+    # identity of its directory. Version 1 journals carried neither and are
+    # not rolled back: nothing could tell whether the path still holds the
+    # directory whose values they are.
+    VERSION = 2
+
+    def __init__(self, dst_root_b: bytes) -> None:
         self.dst_root_b = dst_root_b
+        # (st_dev, st_ino) of the held dst_root; set before the first write.
+        self.root_identity: Optional[Tuple[int, int]] = None
+        self.name = self.name_for(dst_root_b)
+        self.fd = -1
+        self.cond = threading.Condition()
+        self.written = 0
+        self.synced = 0
+        self.syncing = False
+        self.failed: Optional[str] = None
+        self.used = False
+
+    @staticmethod
+    def name_for(dst_root_b: bytes) -> str:
+        digest = hashlib.sha256(os.path.normpath(dst_root_b)).hexdigest()[:24]
+        return f"dstlock-{digest}.journal"
+
+    def _header(self) -> bytes:
+        payload = json.dumps(
+            {
+                "version": self.VERSION,
+                "dst_root_b64": base64.b64encode(self.dst_root_b).decode("ascii"),
+                "dst_root_identity": list(self.root_identity or ()),
+                "program_version": PROGRAM_VERSION,
+                "pid": os.getpid(),
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).encode("ascii")
+        return self.MAGIC + payload + b"\n"
+
+    def _open_locked(self) -> None:
+        wd = working_directory_fd()
+        if wd < 0:
+            raise OSError(
+                errno.ENOENT,
+                f"no usable working directory for the destination journal "
+                f"({working_directory_problem()})",
+            )
+        fd = os.open(
+            self.name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_APPEND
+            | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+            0o600,
+            dir_fd=wd,
+        )
+        try:
+            _write_all(fd, self._header())
+            os.fsync(fd)
+            # The directory entry itself must survive a crash, or the next
+            # start finds nothing to roll back.
+            os.fsync(wd)
+        except BaseException:
+            os.close(fd)
+            try:
+                os.unlink(self.name, dir_fd=wd)
+            except OSError:
+                pass
+            raise
+        self.fd = fd
+        self.used = True
+        log(
+            f"destination journal: {os.path.join(working_directory_display(), self.name)}"
+        )
+
+    def append_durable(self, record: bytes) -> None:
+        """Return only once the record is on stable storage."""
+        with self.cond:
+            if self.failed is not None:
+                raise OSError(errno.EIO, f"destination journal failed earlier: {self.failed}")
+            if self.fd < 0:
+                self._open_locked()
+            _write_all(self.fd, record)
+            self.written += 1
+            ticket = self.written
+            while self.synced < ticket:
+                if self.failed is not None:
+                    raise OSError(errno.EIO, f"destination journal fsync failed: {self.failed}")
+                if self.syncing:
+                    self.cond.wait()
+                    continue
+                self.syncing = True
+                target = self.written
+                error = None
+                self.cond.release()
+                try:
+                    os.fsync(self.fd)
+                except OSError as exc:
+                    error = exc
+                finally:
+                    self.cond.acquire()
+                    self.syncing = False
+                if error is not None:
+                    self.failed = str(error)
+                    self.cond.notify_all()
+                    raise error
+                self.synced = max(self.synced, target)
+                self.cond.notify_all()
+
+    def remove(self) -> None:
+        """The run restored everything it changed: nothing left to roll back."""
+        with self.cond:
+            if self.fd >= 0:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = -1
+            if not self.used:
+                return
+            wd = working_directory_fd()
+            if wd < 0:
+                return
+            try:
+                os.unlink(self.name, dir_fd=wd)
+            except FileNotFoundError:
+                pass
+            self.used = False
+
+    def close_keep(self) -> None:
+        """Leave the journal for the next start to roll back."""
+        with self.cond:
+            if self.fd >= 0:
+                try:
+                    os.close(self.fd)
+                except OSError:
+                    pass
+                self.fd = -1
+
+    @classmethod
+    def read_existing(cls, dst_root_b: bytes):
+        """(header, record bodies) of a journal left by a dead run, or None.
+
+        The bodies come as a generator that reads the file block by block:
+        a journal over a very large tree is never held in memory as a whole.
+        The header is read and checked before anything is returned.
+        """
+        directory = working_directory_display()
+        name = cls.name_for(dst_root_b)
+        label = os.path.join(directory, name)
+        if working_directory_problem() is not None or not os.path.isdir(directory):
+            return None
+        wd = working_directory_fd()
+        if wd < 0:
+            return None
+        try:
+            fd = os.open(
+                name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+                dir_fd=wd,
+            )
+        except FileNotFoundError:
+            return None
+        try:
+            head = b""
+            while len(head) < 64 * 1024:
+                chunk = os.read(fd, 64 * 1024)
+                if not chunk:
+                    break
+                head += chunk
+                if head.find(b"\n", len(cls.MAGIC)) >= 0:
+                    break
+            if not head.startswith(cls.MAGIC) and not cls.MAGIC.startswith(head):
+                raise ValueError(f"{label} is not a destination journal")
+            end = head.find(b"\n", len(cls.MAGIC))
+            if end < 0:
+                # The header itself never became durable: nothing was changed.
+                os.close(fd)
+                return {}, iter(())
+            header = json.loads(head[len(cls.MAGIC):end].decode("ascii"))
+            if header.get("version") != cls.VERSION:
+                raise ValueError(
+                    f"{label} has journal format {header.get('version')!r}, this "
+                    f"program rolls back only format {cls.VERSION}. Inspect the "
+                    f"destination by hand and remove the journal"
+                )
+            if base64.b64decode(header.get("dst_root_b64", "")) != os.path.normpath(dst_root_b):
+                raise ValueError(f"{label} belongs to another dst_root")
+        except BaseException:
+            os.close(fd)
+            raise
+
+        def chunks():
+            try:
+                yield head[end + 1:]
+                while True:
+                    chunk = os.read(fd, 1024 * 1024)
+                    if not chunk:
+                        return
+                    yield chunk
+            finally:
+                os.close(fd)
+
+        # A record whose write was cut off never reached fsync, and the change
+        # it announces was therefore never made.
+        return header, iter_meta_bodies(chunks(), label, tolerate_truncated_tail=True)
+
+    @classmethod
+    def discard_existing(cls, dst_root_b: bytes) -> None:
+        wd = working_directory_fd()
+        if wd < 0:
+            return
+        try:
+            os.unlink(cls.name_for(dst_root_b), dir_fd=wd)
+        except FileNotFoundError:
+            pass
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _read_xattr_or_none(getter, name: str) -> Optional[bytes]:
+    try:
+        return getter(name)
+    except OSError as exc:
+        if exc.errno in (errno.ENODATA, getattr(errno, "ENOATTR", errno.ENODATA),
+                         errno.ENOTSUP, errno.EOPNOTSUPP):
+            return None
+        raise
+
+
+class DestinationGuard:
+    """Holds dst_root, locks destination directories and reports how well.
+
+    dst_root is opened ONCE and held for the whole run. Every walk below it
+    starts from a duplicate of that descriptor instead of resolving the path
+    from "/" again, so a dst_root renamed or replaced during the run cannot
+    redirect the writes or the final restore anywhere else.
+    """
+
+    def __init__(self, cfg: dict) -> None:
+        self.cfg = cfg
+        self.dst_root_b = os.fsencode(os.path.normpath(cfg["dst_root"]))
+        self.euid = os.geteuid()
+        self.root_fd = -1
+        self.root_identity = None
+        self.root_created = False
+        self.lock_held = False
+        self.chain_problem: Optional[str] = None
+        self.root_problem: Optional[str] = None
+        self.lock = threading.Lock()
+        self.unlocked_count = 0
+        # Directories that could not be locked, by identity: several workers
+        # meet the same one, and it is one unprotected directory, not three.
+        # Only failures are held, so this stays small.
+        self.unlocked_identities = set()
+        self.violation_count = 0
+        self.journal = DestinationJournal(self.dst_root_b)
+        self.journal_problem: Optional[str] = None
+
+    # -- state ---------------------------------------------------------
+
+    def is_locked_state(self, st) -> bool:
+        return (
+            int(st.st_uid) == self.euid
+            and (st.st_mode & 0o077) == 0
+            and (st.st_mode & 0o700) == DESTINATION_LOCK_PERMISSIONS
+        )
+
+    def status(self) -> str:
+        if self.chain_problem is not None or self.root_problem is not None:
+            return "not_enforced"
+        if self.unlocked_count or self.violation_count:
+            return "partial"
+        return "enforced"
+
+    def summary(self) -> dict:
+        return {
+            "destination_protection": self.status(),
+            "destination_unlocked_directory_count": self.unlocked_count,
+            "destination_protection_violation_count": self.violation_count,
+            "destination_root_problem": self.root_problem,
+            "destination_parent_chain_problem": self.chain_problem,
+            "destination_journal_available": self.journal_problem is None,
+        }
+
+    def note_unlocked(self, rel_b: bytes, reason: str) -> None:
+        with self.lock:
+            self.unlocked_count += 1
+            count = self.unlocked_count
+        if count <= 20:
+            log(
+                f"WARNING: destination directory is NOT protected during the "
+                f"run: {path_display(rel_b)}: {reason}"
+            )
+        elif count == 21:
+            log("WARNING: further unprotected destination directories are only counted")
+
+    def note_violation(self, rel_b: bytes, st) -> None:
+        with self.lock:
+            self.violation_count += 1
+            count = self.violation_count
+        if count <= 20:
+            log(
+                f"WARNING: destination directory was released during the run: "
+                f"{path_display(rel_b)} is uid={st.st_uid} "
+                f"mode={stat.S_IMODE(st.st_mode):04o}, not locked"
+            )
+
+    # -- setup ---------------------------------------------------------
+
+    def _check_parent_chain(self) -> Optional[str]:
+        """Why an ancestor of dst_root lets somebody else replace it, or None.
+
+        Walked through descriptors from "/", the same way the root is then
+        opened, so the chain that is judged is the chain that is used.
+        """
+        parent_b = os.path.dirname(self.dst_root_b) or b"/"
+        fd = os.open(b"/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            walked = b"/"
+            parts = [p for p in parent_b.split(b"/") if p]
+            for index in range(len(parts) + 1):
+                st = os.fstat(fd)
+                if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not (
+                    st.st_mode & stat.S_ISVTX
+                ):
+                    return f"{path_display(walked)} is writable by group or other"
+                if int(st.st_uid) not in (self.euid, 0):
+                    return (
+                        f"{path_display(walked)} is owned by uid {st.st_uid}, "
+                        f"who can replace what is inside it"
+                    )
+                if index == len(parts):
+                    return None
+                next_fd = os.open(
+                    parts[index], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                    dir_fd=fd,
+                )
+                os.close(fd)
+                fd = next_fd
+                walked = os.path.join(walked, parts[index])
+        finally:
+            os.close(fd)
+        return None
+
+    def start(self, src_st=None) -> None:
+        """Open dst_root, roll back an interrupted run, lock the root.
+
+        A start that fails removes again what it created itself - dst_root
+        and any missing ancestor - as long as each is still the directory it
+        created and still empty. The lock can only be taken on a directory
+        that exists, so creating first is unavoidable; leaving an empty,
+        locked dst_root behind after a refused start is not.
+        """
+        # (holder fd, name, identity) of every directory this start created,
+        # outermost first. The holder is the parent it was created in.
+        created_chain = []
+        try:
+            self._open_root(created_chain)
+            self._start_locked(created_chain)
+        except BaseException:
+            self._undo_created(created_chain)
+            raise
+        finally:
+            for holder_fd, _name, _identity in created_chain:
+                try:
+                    os.close(holder_fd)
+                except OSError:
+                    pass
+
+    def _open_root(self, created_chain: list) -> None:
+        parent_b = os.path.dirname(self.dst_root_b) or b"/"
+        leaf_b = os.path.basename(self.dst_root_b)
+        # The root may be reached through a symlink: that is how filesystems
+        # are laid out. Missing ancestors are created as before (0755).
+        fd = os.open(b"/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            components = [p for p in parent_b.split(b"/") if p]
+            if leaf_b:
+                components.append(leaf_b)
+            for index, part in enumerate(components):
+                is_root = bool(leaf_b) and index == len(components) - 1
+                created = False
+                try:
+                    os.mkdir(
+                        part,
+                        DESTINATION_LOCK_PERMISSIONS if is_root else 0o755,
+                        dir_fd=fd,
+                    )
+                    created = True
+                except FileExistsError:
+                    pass
+                next_fd = os.open(
+                    part, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=fd
+                )
+                if created:
+                    st = os.fstat(next_fd)
+                    created_chain.append(
+                        (os.dup(fd), part, (int(st.st_dev), int(st.st_ino)))
+                    )
+                os.close(fd)
+                fd = next_fd
+            self.root_fd = fd
+            fd = -1
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        self.root_created = bool(created_chain) and bool(leaf_b) and (
+            created_chain[-1][1] == leaf_b
+        )
+
+    def _undo_created(self, created_chain: list) -> None:
+        """Remove, innermost first, what this start created and left empty.
+
+        Never while another run holds the lock: two starts may race for a
+        missing dst_root, and the one that created it can lose the lock to
+        the other - which is then working in it. The removal happens while
+        this start holds the lock itself, so nobody can take it in between.
+        Where flock() is not available at all, no other run can hold it.
+        """
+        try:
+            if created_chain and self.root_fd >= 0 and not self.lock_held:
+                try:
+                    fcntl.flock(self.root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    self.lock_held = True
+                except BlockingIOError:
+                    log(
+                        f"another run holds {path_display(self.dst_root_b)}; "
+                        f"nothing created by this failed start is removed"
+                    )
+                    return
+                except OSError:
+                    pass
+            self._remove_created(created_chain)
+        finally:
+            if self.root_fd >= 0:
+                try:
+                    os.close(self.root_fd)
+                except OSError:
+                    pass
+                self.root_fd = -1
+                self.lock_held = False
+
+    def _remove_created(self, created_chain: list) -> None:
+        for holder_fd, name_b, identity in reversed(created_chain):
+            try:
+                st = os.stat(name_b, dir_fd=holder_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                log(f"WARNING: cannot inspect {path_display(name_b)} created by this start: {exc}")
+                return
+            if (int(st.st_dev), int(st.st_ino)) != identity or not stat.S_ISDIR(st.st_mode):
+                log(
+                    f"WARNING: {path_display(name_b)}, created by this failed "
+                    f"start, was replaced in the meantime; it is left in place"
+                )
+                return
+            try:
+                # rmdir removes nothing but an empty directory.
+                os.rmdir(name_b, dir_fd=holder_fd)
+                log(f"removed {path_display(name_b)}, created by this failed start")
+            except OSError as exc:
+                log(
+                    f"WARNING: {path_display(name_b)}, created by this failed "
+                    f"start, is left in place: {exc}"
+                )
+                return
+
+    def _start_locked(self, created_chain: list) -> None:
+        created = self.root_created
+        root_st = os.fstat(self.root_fd)
+        self.root_identity = (int(root_st.st_dev), int(root_st.st_ino))
+
+        # One run per destination. The lock sits on dst_root itself, not on a
+        # file in working_directory: two runs with different working
+        # directories must exclude each other just the same. It is held on the
+        # descriptor until close() - after the restore - and the kernel drops
+        # it when the process dies, which is what makes a journal found while
+        # holding it a genuine leftover of a dead run.
+        self.acquire_exclusive_lock()
+        self.journal.root_identity = self.root_identity
+
+        self.chain_problem = self._check_parent_chain()
+        if self.chain_problem is not None:
+            log(
+                f"WARNING: the directory chain above dst_root is not "
+                f"trustworthy: {self.chain_problem}. Whoever controls it can "
+                f"move dst_root away and put another directory in its place; "
+                f"this run holds dst_root open and keeps writing into the "
+                f"original, but the tree is reported as not protected"
+            )
+
+        recover_interrupted_run(self)
+
+        if created:
+            # Created by this run: already locked. What mode it should have
+            # in the end is fixed now, when it is known that it is new.
+            record_created_root(self.cfg)
+        locked = self.lock_directory(self.root_fd, b".")
+        if not locked:
+            self.root_problem = "dst_root could not be locked"
+        root_st = os.fstat(self.root_fd)
+        log(
+            f"destination protection: dst_root uid={root_st.st_uid} "
+            f"mode={stat.S_IMODE(root_st.st_mode):04o} "
+            f"{'locked' if locked else 'NOT locked'}; status {self.status()}"
+        )
+
+    def acquire_exclusive_lock(self) -> None:
+        try:
+            fcntl.flock(self.root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.lock_held = True
+        except BlockingIOError:
+            raise RuntimeError(
+                f"another run is working on dst_root "
+                f"{path_display(self.dst_root_b)}; two runs on one destination "
+                f"would undo each other's lock and restore"
+            ) from None
+        except OSError as exc:
+            # Lustre mounted without -o flock (or localflock) answers flock()
+            # with an error. Running on without the lock would leave two runs
+            # free to roll back each other's journal; that is refused.
+            raise RuntimeError(
+                f"cannot take the exclusive run lock on dst_root "
+                f"{path_display(self.dst_root_b)}: {exc}. On Lustre, mount the "
+                f"client with -o flock (cluster-wide) or -o localflock (this "
+                f"node only)"
+            ) from exc
+
+    def open_root(self) -> int:
+        """A private duplicate of the held dst_root descriptor."""
+        return os.dup(self.root_fd)
+
+    def close(self) -> None:
+        if self.root_fd >= 0:
+            try:
+                os.close(self.root_fd)
+            except OSError:
+                pass
+            self.root_fd = -1
+
+    # -- locking -------------------------------------------------------
+
+    def lock_directory(self, fd: int, rel_b: bytes) -> bool:
+        """Lock one destination directory; see lock_directories()."""
+        return self.lock_directories([(fd, rel_b)])[0]
+
+    def lock_directories(self, items) -> List[bool]:
+        """Lock destination directories; record and journal what changes.
+
+        items is a list of (fd, rel_b). Returns, per item, whether the
+        directory is locked afterwards. Nothing is recorded for a directory
+        that is already locked: it is either one this run locked earlier -
+        whose original values are already recorded - or one that was like
+        this before, which needs nothing restored.
+
+        All original values of one call go into the journal together and are
+        made durable with ONE fsync before the first directory is changed.
+        A batch prelocks its directories this way, so a run over an existing
+        tree pays one journal flush per batch rather than one per directory.
+        """
+        results = [True] * len(items)
+        pending = []
+        records = []
+        for index, (fd, rel_b) in enumerate(items):
+            st = os.fstat(fd)
+            if self.is_locked_state(st):
+                continue
+            identity = (int(st.st_dev), int(st.st_ino))
+            with self.lock:
+                if identity in self.unlocked_identities:
+                    results[index] = False
+                    continue
+
+            original = {}
+            if int(st.st_uid) != self.euid:
+                original["uid"] = int(st.st_uid)
+            wanted_mode = (st.st_mode & 0o7000) | DESTINATION_LOCK_PERMISSIONS
+            if stat.S_IMODE(st.st_mode) != wanted_mode:
+                original["mode"] = stat.S_IMODE(st.st_mode)
+                # chmod rewrites the mask of an access ACL, so the ACL is an
+                # original value as well.
+                acl = _read_xattr_or_none(
+                    lambda name: os.getxattr(fd, name), ACL_ACCESS_XATTR
+                )
+                if acl is not None:
+                    original["acl_access"] = acl
+            # Which directory these values belong to. A rollback applies them
+            # only to that same directory, never to whatever holds the path
+            # by then.
+            original["identity"] = identity
+            records.append(
+                encode_meta_record(rel_b, META_KIND_DIR, META_ORIGIN_ORIG, original)
+            )
+            pending.append((index, fd, rel_b, identity, original, wanted_mode))
+
+        if not pending:
+            return results
+
+        try:
+            self.journal.append_durable(b"".join(records))
+        except OSError as exc:
+            if self.journal_problem is None:
+                self.journal_problem = str(exc)
+                log(
+                    f"WARNING: the destination journal cannot be written "
+                    f"({exc}). Directories are locked anyway; if this process "
+                    f"dies, their original owner and mode cannot be rolled "
+                    f"back automatically"
+                )
+        log_object = destination_metadata_log
+        if log_object is not None:
+            try:
+                for record in records:
+                    log_object.record_raw(record)
+            except Exception as exc:
+                note_metadata_record_failure(exc)
+
+        for index, fd, rel_b, identity, original, wanted_mode in pending:
+            try:
+                if "uid" in original:
+                    os.fchown(fd, self.euid, -1)
+                if "mode" in original:
+                    os.fchmod(fd, wanted_mode)
+            except OSError as exc:
+                results[index] = False
+                with self.lock:
+                    if identity in self.unlocked_identities:
+                        continue
+                    self.unlocked_identities.add(identity)
+                self.note_unlocked(rel_b, f"cannot lock it: {exc}")
+        return results
+
+    def prelock(self, rel_dirs) -> None:
+        """Lock the existing destination directories a batch will write into.
+
+        Only what already exists is touched - components are opened with
+        O_NOFOLLOW from the held dst_root, and the walk of a chain stops at
+        the first missing one; new directories are created locked anyway.
+        The walk that later hands out the parent descriptors finds these
+        locked and has nothing left to journal.
+        """
+        opened = {}
+        items = []
+        try:
+            for rel_b in sorted(set(rel_dirs), key=lambda r: (r.count(b"/"), r)):
+                if not rel_b or rel_b == b".":
+                    continue
+                parts = rel_b.split(b"/")
+                parent_fd = self.root_fd
+                walked = b""
+                for part in parts:
+                    walked = os.path.join(walked, part) if walked else part
+                    fd = opened.get(walked)
+                    if fd is None:
+                        if walked in opened:
+                            break
+                        try:
+                            fd = os.open(
+                                part,
+                                os.O_RDONLY | os.O_DIRECTORY
+                                | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+                                dir_fd=parent_fd,
+                            )
+                        except OSError:
+                            # Missing, not a directory or a symlink: the
+                            # ordinary walk creates it or reports it.
+                            opened[walked] = None
+                            break
+                        opened[walked] = fd
+                        items.append((fd, walked))
+                    parent_fd = fd
+            if items:
+                self.lock_directories(items)
+        finally:
+            for fd in opened.values():
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+
+
+destination_guard: Optional[DestinationGuard] = None
+# A guard whose run lock must outlive the run: kept referenced, never closed.
+_abandoned_guard: Optional[DestinationGuard] = None
+# How long the shutdown waits for each worker thread before it gives up on
+# restoring the destination and leaves the tree locked instead.
+WORKER_JOIN_TIMEOUT_SEC = 30.0
+destination_metadata_log: Optional[MetadataLog] = None
+destination_file_metadata_log: Optional[MetadataLog] = None
+# Set whenever a record could not be written or the restore did not complete.
+# Every such case ends the run with exit status 1.
+metadata_restore_incomplete = threading.Event()
+
+
+def note_metadata_record_failure(exc: Exception) -> None:
+    # Losing a record silently would produce a destination with wrong
+    # metadata that still reports success.
+    if not metadata_restore_incomplete.is_set():
+        log(f"WARNING: cannot record destination metadata: {exc}")
+    metadata_restore_incomplete.set()
+
+
+def _source_xattr_fields(listxattr, getxattr, is_directory: bool) -> dict:
+    """The xattr and ACL fields a destination object must end up with."""
+    names = set(listxattr())
+    fields = {
+        "acl_access": (
+            getxattr(ACL_ACCESS_XATTR) if ACL_ACCESS_XATTR in names else None
+        ),
+        "xattrs": {
+            os.fsencode(name): getxattr(name)
+            for name in names
+            if name not in _ACL_XATTR_NAMES
+        },
+    }
+    if is_directory:
+        fields["acl_default"] = (
+            getxattr(ACL_DEFAULT_XATTR) if ACL_DEFAULT_XATTR in names else None
+        )
+    return fields
+
+
+def directory_final_fields(src_st, src_fd: Optional[int], cfg: dict, created: bool) -> dict:
+    fields = {}
+    if permissions_owner(cfg):
+        fields["uid"] = int(src_st.st_uid)
+    if permissions_group(cfg):
+        fields["gid"] = int(src_st.st_gid)
+    if permissions_mode(cfg):
+        fields["mode"] = stat.S_IMODE(src_st.st_mode)
+    elif created:
+        # No mode class: a directory this run created gets what mkdir would
+        # have given it, fixed now, while it is known to be new.
+        fields["mode"] = 0o777 & ~get_process_umask()
+    if cfg.get("xattr", False) and src_fd is not None:
+        try:
+            fields.update(_source_xattr_fields(
+                lambda: os.listxattr(src_fd),
+                lambda name: os.getxattr(src_fd, name),
+                True,
+            ))
+        except (OSError, AttributeError) as exc:
+            raise OSError(
+                getattr(exc, "errno", errno.ENOTSUP) or errno.ENOTSUP,
+                f"cannot read source directory xattrs: {exc}",
+            ) from exc
+    if mtime_enabled(cfg):
+        fields["times"] = (int(src_st.st_atime_ns), int(src_st.st_mtime_ns))
+    return fields
+
+
+def record_directory_final(
+    rel_b: bytes,
+    src_st,
+    src_fd: Optional[int],
+    cfg: dict,
+    created: bool,
+    locked: bool,
+) -> None:
+    """Note what one destination directory must look like at the end."""
+    log_object = destination_metadata_log
+    if log_object is None:
+        return
+    fields = directory_final_fields(src_st, src_fd, cfg, created)
+    if locked:
+        fields["locked"] = True
+    try:
+        log_object.record_entry(rel_b or b".", META_KIND_DIR, META_ORIGIN_FINAL, fields)
+    except Exception as exc:
+        note_metadata_record_failure(exc)
+
+
+def record_created_root(cfg: dict) -> None:
+    log_object = destination_metadata_log
+    if log_object is None or permissions_mode(cfg):
+        return
+    try:
+        log_object.record_entry(
+            b".", META_KIND_DIR, META_ORIGIN_FINAL,
+            {"mode": 0o777 & ~get_process_umask(), "locked": True},
+        )
+    except Exception as exc:
+        note_metadata_record_failure(exc)
+
+
+def record_root_final(cfg: dict) -> None:
+    """dst_root takes the configured metadata of src_root, like any directory."""
+    if destination_metadata_log is None:
+        return
+    src_fd = open_dir_fd_componentwise(os.fsencode(cfg["src_root"]), create=False)
+    try:
+        record_directory_final(
+            b".", os.fstat(src_fd), src_fd, cfg, created=False,
+            locked=destination_guard is not None
+            and destination_guard.root_problem is None,
+        )
+    finally:
+        os.close(src_fd)
+
+
+def record_file_final(
+    rel_b: bytes, src_st, src_parent_fd: int, leaf_b: bytes, cfg: dict
+) -> None:
+    """rsync only: the metadata a file or symlink gets in the restore phase."""
+    log_object = destination_file_metadata_log
+    if log_object is None:
+        return
+    if stat.S_ISLNK(src_st.st_mode):
+        kind = META_KIND_SYMLINK
+    elif stat.S_ISREG(src_st.st_mode):
+        kind = META_KIND_FILE
+    else:
+        return
+    fields = {}
+    if permissions_owner(cfg):
+        fields["uid"] = int(src_st.st_uid)
+    if permissions_group(cfg):
+        fields["gid"] = int(src_st.st_gid)
+    if permissions_mode(cfg) and kind == META_KIND_FILE:
+        fields["mode"] = stat.S_IMODE(src_st.st_mode)
+    if cfg.get("xattr", False):
+        path_b = os.fsencode(f"/proc/self/fd/{src_parent_fd}/") + leaf_b
+        try:
+            xattr_fields = _source_xattr_fields(
+                lambda: os.listxattr(path_b, follow_symlinks=False),
+                lambda name: os.getxattr(path_b, name, follow_symlinks=False),
+                False,
+            )
+        except (OSError, AttributeError) as exc:
+            raise OSError(
+                getattr(exc, "errno", errno.ENOTSUP) or errno.ENOTSUP,
+                f"cannot read source xattrs: {exc}",
+            ) from exc
+        if kind == META_KIND_SYMLINK:
+            # Symlinks carry no ACL; user.* is not allowed on them at all.
+            xattr_fields.pop("acl_access", None)
+        fields.update(xattr_fields)
+    if not fields:
+        return
+    try:
+        log_object.record_entry(rel_b, kind, META_ORIGIN_FINAL, fields)
+    except Exception as exc:
+        note_metadata_record_failure(exc)
+
+
+# -- restore -------------------------------------------------------------
+
+
+class _FdTarget:
+    """Metadata operations on an open descriptor."""
+
+    is_symlink = False
+
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+
+    def stat(self):
+        return os.fstat(self.fd)
+
+    def chown(self, uid: int, gid: int) -> None:
+        os.fchown(self.fd, uid, gid)
+
+    def chmod(self, mode: int) -> None:
+        os.fchmod(self.fd, mode)
+
+    def listxattr(self):
+        return os.listxattr(self.fd)
+
+    def getxattr(self, name: str) -> bytes:
+        return os.getxattr(self.fd, name)
+
+    def setxattr(self, name: str, value: bytes) -> None:
+        os.setxattr(self.fd, name, value)
+
+    def removexattr(self, name: str) -> None:
+        os.removexattr(self.fd, name)
+
+    def utime(self, times) -> None:
+        os.utime(self.fd, ns=tuple(times))
+
+
+class _AtTarget:
+    """Metadata operations on a name inside a held parent directory.
+
+    Used for symlinks, which cannot be opened, and for files an unprivileged
+    run cannot open. The parent is a locked directory of this run, so the
+    name cannot be swapped by anybody else between the checks and the call.
+    """
+
+    def __init__(self, parent_fd: int, leaf_b: bytes, is_symlink: bool) -> None:
+        self.parent_fd = parent_fd
+        self.leaf_b = leaf_b
+        self.is_symlink = is_symlink
+        self.proc_path = os.fsencode(f"/proc/self/fd/{parent_fd}/") + leaf_b
+
+    def stat(self):
+        return os.stat(self.leaf_b, dir_fd=self.parent_fd, follow_symlinks=False)
+
+    def chown(self, uid: int, gid: int) -> None:
+        os.chown(self.leaf_b, uid, gid, dir_fd=self.parent_fd, follow_symlinks=False)
+
+    def chmod(self, mode: int) -> None:
+        if self.is_symlink:
+            return
+        os.chmod(self.leaf_b, mode, dir_fd=self.parent_fd)
+
+    def listxattr(self):
+        return os.listxattr(self.proc_path, follow_symlinks=False)
+
+    def getxattr(self, name: str) -> bytes:
+        return os.getxattr(self.proc_path, name, follow_symlinks=False)
+
+    def setxattr(self, name: str, value: bytes) -> None:
+        os.setxattr(self.proc_path, name, value, follow_symlinks=False)
+
+    def removexattr(self, name: str) -> None:
+        os.removexattr(self.proc_path, name, follow_symlinks=False)
+
+    def utime(self, times) -> None:
+        os.utime(self.leaf_b, ns=tuple(times), dir_fd=self.parent_fd,
+                 follow_symlinks=False)
+
+
+def _apply_meta_fields(target, fields: dict, rel_b: bytes, counters: dict) -> None:
+    """Apply one merged entry in the fixed order, then verify it.
+
+    chown first: it clears setuid/setgid and security.capability of files.
+    Then the plain xattrs, while the mode still allows writing them. Then the
+    ACLs, which rewrite the group bits. Then chmod, which puts the special
+    bits back and fixes the ACL mask to the final group bits. Then everything
+    is checked, and the timestamps come last: nothing after them may touch
+    the object again.
+    """
+    guard = destination_guard
+    st = target.stat()
+    if fields.get("locked") and guard is not None and not guard.is_locked_state(st):
+        guard.note_violation(rel_b, st)
+        counters["violations"] += 1
+
+    ownership_applied = True
+    uid = fields.get("uid")
+    gid = fields.get("gid")
+    want_uid = uid if uid is not None and uid != st.st_uid else -1
+    want_gid = gid if gid is not None and gid != st.st_gid else -1
+    if want_uid != -1 or want_gid != -1:
+        try:
+            target.chown(want_uid, want_gid)
+        except PermissionError:
+            # chown needs privileges; tolerated as everywhere else, counted.
+            ownership_applied = False
+            counters["ownership_not_preserved"] += 1
+
+    if "xattrs" in fields:
+        wanted = {os.fsdecode(name): value for name, value in fields["xattrs"].items()}
+        current = {name for name in target.listxattr() if name not in _ACL_XATTR_NAMES}
+        for name in sorted(current - set(wanted)):
+            if not os.fsencode(name).startswith(b"user."):
+                raise OSError(
+                    errno.EPERM,
+                    f"extra destination xattr needs manual handling: {name!r}",
+                )
+            target.removexattr(name)
+        for name in sorted(wanted):
+            if _read_xattr_or_none(target.getxattr, name) != wanted[name]:
+                target.setxattr(name, wanted[name])
+
+    for key, name in _ACL_FIELDS:
+        if key not in fields:
+            continue
+        value = fields[key]
+        current = _read_xattr_or_none(target.getxattr, name)
+        if value is None:
+            if current is not None:
+                target.removexattr(name)
+        elif current != value:
+            target.setxattr(name, value)
+
+    if "mode" in fields and not target.is_symlink:
+        if stat.S_IMODE(target.stat().st_mode) != fields["mode"]:
+            target.chmod(fields["mode"])
+
+    st = target.stat()
+    problems = []
+    if "mode" in fields and not target.is_symlink and stat.S_IMODE(st.st_mode) != fields["mode"]:
+        problems.append(
+            f"mode is {stat.S_IMODE(st.st_mode):04o}, expected {fields['mode']:04o}"
+        )
+    if ownership_applied:
+        if uid is not None and st.st_uid != uid:
+            problems.append(f"uid is {st.st_uid}, expected {uid}")
+        if gid is not None and st.st_gid != gid:
+            problems.append(f"gid is {st.st_gid}, expected {gid}")
+    for key, name in _ACL_FIELDS:
+        if key in fields and not fields.get("_acl_unverified"):
+            if _read_xattr_or_none(target.getxattr, name) != fields[key]:
+                problems.append(f"{name} differs after restore")
+    if "xattrs" in fields:
+        for name, value in fields["xattrs"].items():
+            if _read_xattr_or_none(target.getxattr, os.fsdecode(name)) != value:
+                problems.append(f"xattr {os.fsdecode(name)!r} differs after restore")
+    if problems:
+        raise OSError(errno.EIO, "; ".join(problems))
+
+    if "times" in fields:
+        target.utime(fields["times"])
+
+
+class _MetadataApplier:
+    """Applies entries below the held dst_root; one instance per thread."""
+
+    def __init__(self, max_parent_entries: int = 64, rollback: bool = False) -> None:
+        # rollback: the entries come from a dead run's journal. A directory
+        # that is gone since has nothing left to roll back, and one that is
+        # not the journalled directory or no longer locked is left alone.
+        self.rollback = rollback
         self.max_parent_entries = max(1, int(max_parent_entries))
         self.parents = OrderedDict()
-        self.records = 0
-        self.applied = 0
-        self.failed = 0
+        self.counters = {
+            "records": 0,
+            "applied": 0,
+            "failed": 0,
+            "violations": 0,
+            "ownership_not_preserved": 0,
+            "left_locked": 0,
+            "missing": 0,
+            "skipped": 0,
+        }
         self.errors = []
 
     def _parent_fd(self, rel_parent_b: bytes) -> int:
+        guard = destination_guard
+        if not rel_parent_b:
+            return guard.root_fd
         descriptor = self.parents.get(rel_parent_b)
         if descriptor is not None:
             self.parents.move_to_end(rel_parent_b)
             return descriptor
-
-        absolute_b = (
-            os.path.join(self.dst_root_b, rel_parent_b)
-            if rel_parent_b
-            else self.dst_root_b
-        )
-        # nofollow_from is the destination root: below it a directory symlink
-        # is refused. follow_symlinks=False on the utime() only protects the
-        # LAST component, so without this a symlink anywhere in between was
-        # walked through and the timestamps of a file outside the tree were
-        # changed - with the repair reporting success.
-        descriptor = open_dir_fd_componentwise(
-            absolute_b, create=False, nofollow_from=self.dst_root_b
-        )
+        # Below dst_root nothing is followed: every component is opened with
+        # O_NOFOLLOW, starting from the descriptor held since the start.
+        descriptor = guard.open_root()
+        try:
+            for part in rel_parent_b.split(b"/"):
+                next_fd = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+                    | os.O_CLOEXEC,
+                    dir_fd=descriptor,
+                )
+                os.close(descriptor)
+                descriptor = next_fd
+        except BaseException:
+            os.close(descriptor)
+            raise
         self.parents[rel_parent_b] = descriptor
         while len(self.parents) > self.max_parent_entries:
             _, evicted = self.parents.popitem(last=False)
@@ -5510,24 +6769,142 @@ class _DirectoryTimeApplier:
                 pass
         return descriptor
 
-    def apply(self, rel_dir_b: bytes, atime_ns: int, mtime_ns: int) -> None:
-        self.records += 1
+    def apply(self, rel_b: bytes, kind: int, fields: dict) -> None:
+        self.counters["records"] += 1
+        fd = None
         try:
-            # The log is a file that survives a stopped run, so its records are
-            # treated as input rather than as trusted internal state: a ".."
-            # component would otherwise reach outside dst_root.
-            validate_relative_path(rel_dir_b, allow_root=False)
-            os.utime(
-                os.path.basename(rel_dir_b),
-                ns=(atime_ns, mtime_ns),
-                dir_fd=self._parent_fd(os.path.dirname(rel_dir_b)),
-                follow_symlinks=False,
+            validate_relative_path(rel_b, allow_root=True)
+            if rel_b == b".":
+                fd = destination_guard.open_root()
+                target = _FdTarget(fd)
+            else:
+                parent_fd = self._parent_fd(os.path.dirname(rel_b))
+                leaf_b = os.path.basename(rel_b)
+                if kind == META_KIND_DIR:
+                    fd = os.open(
+                        leaf_b,
+                        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+                        | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                    target = _FdTarget(fd)
+                elif kind == META_KIND_FILE:
+                    try:
+                        fd = os.open(
+                            leaf_b,
+                            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                            | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC,
+                            dir_fd=parent_fd,
+                        )
+                        target = _FdTarget(fd)
+                    except PermissionError:
+                        target = _AtTarget(parent_fd, leaf_b, False)
+                    if not stat.S_ISREG(target.stat().st_mode):
+                        raise OSError(errno.EINVAL, "destination is no longer a regular file")
+                elif kind == META_KIND_SYMLINK:
+                    target = _AtTarget(parent_fd, leaf_b, True)
+                    if not stat.S_ISLNK(target.stat().st_mode):
+                        raise OSError(errno.EINVAL, "destination is no longer a symlink")
+                else:
+                    raise ValueError(f"unknown metadata record kind {kind}")
+            if self.rollback and "identity" not in fields:
+                self.counters["skipped"] += 1
+                log(
+                    f"WARNING: rollback skips {path_display(rel_b)}: the "
+                    f"journal record names no directory identity"
+                )
+                return
+            if "identity" in fields:
+                fields = self._check_identity(target, rel_b, fields)
+                if fields is None:
+                    return
+            _apply_meta_fields(target, fields, rel_b, self.counters)
+            self.counters["applied"] += 1
+        except FileNotFoundError as exc:
+            if kind == META_KIND_DIR and self.rollback:
+                self.counters["missing"] += 1
+            elif kind == META_KIND_DIR:
+                self._fail(rel_b, exc)
+                self._report_left_locked(rel_b)
+            else:
+                # The transfer of this file did not happen - it failed, or its
+                # batch was stopped - and was reported there already.
+                self.counters["missing"] += 1
+        except Exception as exc:
+            self._fail(rel_b, exc)
+            if kind == META_KIND_DIR:
+                self._report_left_locked(rel_b)
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _check_identity(self, target, rel_b: bytes, fields: dict) -> Optional[dict]:
+        """Original values only go back onto the directory they came from.
+
+        Returns the fields to apply, or None to leave the object alone.
+        """
+        st = target.stat()
+        same = (int(st.st_dev), int(st.st_ino)) == tuple(fields["identity"])
+        if self.rollback:
+            reason = None
+            if not same:
+                reason = "it is not the directory the journal was written for"
+            elif not destination_guard.is_locked_state(st):
+                reason = (
+                    f"it is no longer locked (uid={st.st_uid} "
+                    f"mode={stat.S_IMODE(st.st_mode):04o}); somebody changed it"
+                )
+            if reason is not None:
+                self.counters["skipped"] += 1
+                log(
+                    f"WARNING: rollback skips {path_display(rel_b)}: {reason}. "
+                    f"path_b64={base64.b64encode(rel_b).decode('ascii')}"
+                )
+                return None
+            return fields
+        if same:
+            return fields
+        # Replaced during the run: the source values still apply to what is
+        # there now, the original values of another directory do not.
+        self.counters["skipped"] += 1
+        log(
+            f"WARNING: {path_display(rel_b)} is not the directory this run "
+            f"locked; its original values are not applied to it"
+        )
+        return {
+            key: value for key, value in fields.items()
+            if key not in fields.get("_orig_keys", ()) and key != "identity"
+        }
+
+    def _fail(self, rel_b: bytes, exc: Exception) -> None:
+        self.counters["failed"] += 1
+        if len(self.errors) < 10:
+            self.errors.append(f"{path_display(rel_b)}: {exc}")
+
+    def _report_left_locked(self, rel_b: bytes) -> None:
+        guard = destination_guard
+        try:
+            if rel_b == b".":
+                st = os.fstat(guard.root_fd)
+            else:
+                st = os.stat(
+                    os.path.basename(rel_b),
+                    dir_fd=self._parent_fd(os.path.dirname(rel_b)),
+                    follow_symlinks=False,
+                )
+        except Exception:
+            return
+        if guard.is_locked_state(st):
+            self.counters["left_locked"] += 1
+            # base64 as well, so the name survives any encoding.
+            log(
+                f"WARNING: destination directory left locked "
+                f"(mode {stat.S_IMODE(st.st_mode):04o}): {path_display(rel_b)} "
+                f"path_b64={base64.b64encode(rel_b).decode('ascii')}"
             )
-            self.applied += 1
-        except (Exception, ValueError) as exc:
-            self.failed += 1
-            if len(self.errors) < 10:
-                self.errors.append(f"{path_display(rel_dir_b)}: {exc}")
 
     def close(self) -> None:
         while self.parents:
@@ -5538,172 +6915,476 @@ class _DirectoryTimeApplier:
                 pass
 
 
-def repair_directory_times(log_object: "DirectoryTimesLog", cfg: dict) -> dict:
-    """Apply the recorded source timestamps to the destination directories.
+def _meta_depth(rel_b: bytes) -> int:
+    return 0 if rel_b == b"." else rel_b.count(b"/") + 1
 
-    Runs only when every worker has finished, so nothing writes into these
-    directories any more. Ordering between different directories is irrelevant:
-    utimensat on a directory does not change its parent's mtime.
 
-    One utimensat per directory is unavoidable, and on a network filesystem
-    that is a metadata roundtrip. The pass is therefore latency-bound and is
-    spread over max_workers threads.
+class _SortRun:
+    """One sorted run of the external sort, compressed.
 
-    Records are sharded by their PARENT directory, not by the full path. That
-    keeps two properties at once:
-
-      * every child of one directory lands in the same thread, so that thread's
-        parent-fd cache stays warm. Sharding by full path would scatter
-        siblings across threads and each one would re-walk the same parent;
-        measured, that drops the cache hit rate from 95% to 6%.
-      * records for one directory keep their relative order, so a duplicate
-        still resolves to the last one written, exactly as in a serial replay.
-
-    A destination tree whose directories all share a single parent therefore
-    serialises onto one thread. That case has a 100% cache hit rate and is the
-    cheapest per record, but it does not benefit from the extra threads.
+    Kept in an unlinked file in the working directory when there is one, in
+    memory otherwise. Either way it holds deflate output, not Python objects.
     """
-    result = {"records": 0, "applied": 0, "failed": 0, "threads": 1}
-    if log_object is None:
-        return result
 
-    dst_root_b = os.fsencode(cfg["dst_root"])
-    thread_count = max(1, int(cfg.get("max_workers", 1)))
-    if log_object.record_count < DIRECTORY_REPAIR_MIN_PARALLEL_RECORDS:
-        thread_count = 1
-
-    if thread_count == 1:
-        appliers = [_DirectoryTimeApplier(dst_root_b)]
-        try:
-            for rel_dir_b, atime_ns, mtime_ns in log_object.replay():
-                appliers[0].apply(rel_dir_b, atime_ns, mtime_ns)
-        finally:
-            appliers[0].close()
-    else:
-        # n threads x cache size must stay well below the fd limit.
-        per_thread_cache = max(8, 256 // thread_count)
-        appliers = [
-            _DirectoryTimeApplier(dst_root_b, per_thread_cache)
-            for _ in range(thread_count)
-        ]
-        shard_queues = [
-            queue.Queue(maxsize=DIRECTORY_REPAIR_QUEUE_DEPTH)
-            for _ in range(thread_count)
-        ]
-        threads = []
-
-        def repair_worker(index: int) -> None:
-            applier = appliers[index]
-            work = shard_queues[index]
+    def __init__(self) -> None:
+        self.fd = -1
+        self.memory = None
+        wd = working_directory_fd()
+        if wd >= 0:
+            name = run_state_name("mtsort", f".{secrets.token_hex(4)}.tmp")
             try:
-                while True:
-                    item = work.get()
+                self.fd = os.open(
+                    name,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL
+                    | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+                    0o600,
+                    dir_fd=wd,
+                )
+                os.unlink(name, dir_fd=wd)
+            except OSError:
+                self.fd = -1
+        if self.fd < 0:
+            self.memory = io.BytesIO()
+        self.compressor = zlib.compressobj(1)
+
+    def write(self, items) -> None:
+        sink = self.memory
+        for negative_depth, path_b, sequence, body in items:
+            payload = bytearray()
+            _put_varint(payload, -negative_depth)
+            _put_varint(payload, sequence)
+            payload += body
+            framed = bytearray()
+            _put_varint(framed, len(payload))
+            framed += payload
+            data = self.compressor.compress(bytes(framed))
+            if data:
+                self._emit(data, sink)
+        self._emit(self.compressor.flush(), sink)
+
+    def _emit(self, data: bytes, sink) -> None:
+        if sink is not None:
+            sink.write(data)
+        else:
+            _write_all(self.fd, data)
+
+    def _chunks(self):
+        decompressor = zlib.decompressobj()
+        if self.memory is not None:
+            yield decompressor.decompress(self.memory.getvalue())
+        else:
+            os.lseek(self.fd, 0, os.SEEK_SET)
+            while True:
+                data = os.read(self.fd, 1024 * 1024)
+                if not data:
+                    break
+                yield decompressor.decompress(data)
+        yield decompressor.flush()
+
+    def __iter__(self):
+        for payload in iter_meta_bodies(self._chunks(), "<sort run>"):
+            depth, pos = _get_varint(payload, 0)
+            sequence, pos = _get_varint(payload, pos)
+            body = payload[pos:]
+            yield (-depth, meta_body_path(body), sequence, body)
+
+    def close(self) -> None:
+        if self.fd >= 0:
+            os.close(self.fd)
+            self.fd = -1
+        self.memory = None
+
+
+def _sorted_directory_bodies(log_object: MetadataLog, chunk_limit: int):
+    """All directory records, deepest first, grouped by path, in write order.
+
+    An external sort: chunks of at most chunk_limit decoded bytes are sorted
+    in memory, and when there is more than one they are merged from
+    compressed runs. Memory therefore stays bounded however many directories
+    the tree has.
+    """
+    chunk = []
+    size = 0
+    runs = []
+    sequence = 0
+    try:
+        for body in log_object.bodies():
+            path_b = meta_body_path(body)
+            chunk.append((-_meta_depth(path_b), path_b, sequence, body))
+            sequence += 1
+            size += len(body) + 160
+            if size >= chunk_limit:
+                chunk.sort(key=lambda item: item[:3])
+                run = _SortRun()
+                runs.append(run)
+                run.write(chunk)
+                chunk = []
+                size = 0
+        chunk.sort(key=lambda item: item[:3])
+        if not runs:
+            for item in chunk:
+                yield item
+            return
+        run = _SortRun()
+        runs.append(run)
+        run.write(chunk)
+        chunk = []
+        log(
+            f"destination metadata: {sequence} directory records sorted in "
+            f"{len(runs)} runs"
+        )
+        for item in heapq.merge(*runs, key=lambda item: item[:3]):
+            yield item
+    finally:
+        for run in runs:
+            run.close()
+
+
+def _coalesced_directory_entries(sorted_items):
+    """Merge every record of one path into the entry that is applied.
+
+    ORIG values: the first one wins. FINAL values: the last one wins, and a
+    FINAL value always overrides an ORIG value of the same field.
+    """
+    current_path = None
+    current_depth = 0
+    original = {}
+    final = {}
+
+    def merged():
+        entry = dict(original)
+        entry.update(final)
+        orig_only = set(original) - set(final) - {"identity"}
+        if orig_only:
+            entry["_orig_keys"] = frozenset(orig_only)
+        if "acl_access" in original and "acl_access" not in final and "mode" in final:
+            # The original ACL entries with the final group bits: the mask
+            # follows the mode, so the ACL cannot compare equal afterwards.
+            entry["_acl_unverified"] = True
+        return entry
+
+    for negative_depth, path_b, _sequence, body in sorted_items:
+        if path_b != current_path:
+            if current_path is not None:
+                yield current_depth, current_path, merged()
+            current_path = path_b
+            current_depth = -negative_depth
+            original = {}
+            final = {}
+        _, _kind, origin, fields = decode_meta_body(body)
+        if origin == META_ORIGIN_ORIG:
+            for key, value in fields.items():
+                original.setdefault(key, value)
+        else:
+            final.update(fields)
+    if current_path is not None:
+        yield current_depth, current_path, merged()
+
+
+def _apply_entries(entries, thread_count: int, level_barrier: bool,
+                   rollback: bool = False):
+    """Apply (depth, path, kind, fields) entries with bounded parallelism.
+
+    Entries are sharded by their PARENT directory: siblings land in one
+    thread, which keeps that thread's parent-fd cache warm, and records of one
+    path keep their order. With level_barrier every entry of one depth is
+    applied before the next, shallower level starts - a directory is only
+    released once everything below it is done.
+    """
+    if thread_count <= 1:
+        applier = _MetadataApplier(rollback=rollback)
+        try:
+            for _depth, rel_b, kind, fields in entries:
+                applier.apply(rel_b, kind, fields)
+        finally:
+            applier.close()
+        return [applier]
+
+    per_thread_cache = max(8, 256 // thread_count)
+    appliers = [
+        _MetadataApplier(per_thread_cache, rollback=rollback)
+        for _ in range(thread_count)
+    ]
+    queues = [
+        queue.Queue(maxsize=DIRECTORY_REPAIR_QUEUE_DEPTH)
+        for _ in range(thread_count)
+    ]
+
+    def worker(index: int) -> None:
+        applier = appliers[index]
+        work = queues[index]
+        try:
+            while True:
+                item = work.get()
+                try:
                     if item is None:
                         return
                     applier.apply(*item)
-            finally:
-                applier.close()
-
-        for index in range(thread_count):
-            thread = threading.Thread(
-                target=repair_worker,
-                args=(index,),
-                name=f"dirtimes-{index}",
-                daemon=True,
-            )
-            thread.start()
-            threads.append(thread)
-
-        try:
-            for rel_dir_b, atime_ns, mtime_ns in log_object.replay():
-                shard = zlib.crc32(os.path.dirname(rel_dir_b)) % thread_count
-                shard_queues[shard].put((rel_dir_b, atime_ns, mtime_ns))
+                finally:
+                    work.task_done()
         finally:
-            for shard_queue in shard_queues:
-                shard_queue.put(None)
-            for thread in threads:
-                thread.join()
+            applier.close()
 
-    reported_errors = 0
+    threads = [
+        threading.Thread(target=worker, args=(index,), name=f"metarestore-{index}",
+                         daemon=True)
+        for index in range(thread_count)
+    ]
+    for thread in threads:
+        thread.start()
+    current_depth = None
+    try:
+        for depth, rel_b, kind, fields in entries:
+            if level_barrier and depth != current_depth:
+                for work in queues:
+                    work.join()
+                current_depth = depth
+            parent_b = b"" if rel_b == b"." else os.path.dirname(rel_b)
+            queues[zlib.crc32(parent_b) % thread_count].put((rel_b, kind, fields))
+    finally:
+        for work in queues:
+            work.put(None)
+        for thread in threads:
+            thread.join()
+    return appliers
+
+
+def _collect(appliers, label: str) -> dict:
+    result = {
+        "records": 0, "applied": 0, "failed": 0, "violations": 0,
+        "ownership_not_preserved": 0, "left_locked": 0, "missing": 0,
+        "skipped": 0,
+    }
+    reported = 0
     for applier in appliers:
-        result["records"] += applier.records
-        result["applied"] += applier.applied
-        result["failed"] += applier.failed
+        for key in result:
+            result[key] += applier.counters[key]
         for message in applier.errors:
-            if reported_errors >= 10:
+            if reported >= 10:
                 break
-            log(f"WARNING: cannot restore directory timestamps for {message}")
-            reported_errors += 1
-
-    result["threads"] = thread_count
+            log(f"WARNING: cannot restore {label} metadata for {message}")
+            reported += 1
     return result
 
 
-def finalize_directory_times(apply_repair: bool, run_stats: Optional[dict] = None) -> None:
-    """Close the log and, on a clean finish, apply the recorded timestamps."""
-    global directory_times_log
+def _restore_thread_count(cfg: dict, record_count: int) -> int:
+    if record_count < DIRECTORY_REPAIR_MIN_PARALLEL_RECORDS:
+        return 1
+    return max(1, int(cfg.get("max_workers", 1)))
 
-    log_object = directory_times_log
-    if log_object is None:
+
+def restore_files(log_object: Optional[MetadataLog], cfg: dict) -> dict:
+    """rsync: owner, mode, ACL and xattrs of files and symlinks, streamed."""
+    if log_object is None or not log_object.record_count:
+        return _collect([], "file")
+
+    def entries():
+        for body in log_object.bodies():
+            rel_b, kind, _origin, fields = decode_meta_body(body)
+            yield 0, rel_b, kind, fields
+
+    appliers = _apply_entries(
+        entries(), _restore_thread_count(cfg, log_object.record_count),
+        level_barrier=False,
+    )
+    return _collect(appliers, "file")
+
+
+def restore_directories(
+    log_object: Optional[MetadataLog], cfg: dict, rollback: bool = False
+) -> dict:
+    """Directories bottom-up, dst_root last."""
+    if log_object is None or not log_object.record_count:
+        return _collect([], "directory")
+    # The decoded chunk may be as large as the compressed budget: decoded
+    # records are several times larger, but they exist only during this pass.
+    chunk_limit = max(4096, int(cfg.get("metadata_maxsize") or 0))
+    entries = (
+        (depth, rel_b, META_KIND_DIR, fields)
+        for depth, rel_b, fields in _coalesced_directory_entries(
+            _sorted_directory_bodies(log_object, chunk_limit)
+        )
+    )
+    appliers = _apply_entries(
+        entries, _restore_thread_count(cfg, log_object.record_count),
+        level_barrier=True, rollback=rollback,
+    )
+    return _collect(appliers, "directory")
+
+
+def recover_interrupted_run(guard: DestinationGuard) -> None:
+    """Roll back the original values a run that died had journalled.
+
+    Runs with the exclusive lock on dst_root held and before this run locks
+    anything, so the journal found here belongs to a run that is gone.
+
+    Nothing is rolled back onto another directory than the one the values
+    were taken from. dst_root must be the same directory as in the journal
+    header, or the start is refused. Each directory must be the one named by
+    its record's identity AND must still be locked - owned by this user, no
+    permissions for group and other - or it is skipped and reported: somebody
+    changed or replaced it since, and its current state is theirs.
+
+    Directories the dead run created stay locked; they are handled like every
+    other directory of this run. A rollback that does not complete stops the
+    start: locking on top of it would make the originals unrecoverable.
+    """
+    found = DestinationJournal.read_existing(guard.dst_root_b)
+    if found is None:
         return
-    # No worker may append once the repair has started.
-    directory_times_log = None
-
-    try:
-        log_object.close()
-    except Exception as exc:
-        log(f"WARNING: cannot close directory timestamp log: {exc}")
-        directory_times_incomplete.set()
-        return
-
-    if not apply_repair:
-        if log_object.record_count:
-            # There is no resume: the records live in memory, and a spill file
-            # carries a name nobody looks for. Saying "kept for a later run"
-            # would be a promise the program does not keep - and reporting
-            # success here let a stopped run leave every written destination
-            # directory with the time of its last write.
-            log(
-                f"WARNING: the run ended before the directory timestamps could "
-                f"be applied; {log_object.record_count} recorded directories "
-                f"keep the time of their last write. Re-run over the same tree "
-                f"to record and apply them again"
+    header, bodies = found
+    journal_label = os.path.join(
+        working_directory_display(), DestinationJournal.name_for(guard.dst_root_b)
+    )
+    if header:
+        recorded_root = tuple(header.get("dst_root_identity") or ())
+        if recorded_root != tuple(guard.root_identity):
+            raise RuntimeError(
+                f"the journal {journal_label} of an interrupted run belongs to "
+                f"dst_root identity {recorded_root!r}, but the directory at "
+                f"{path_display(guard.dst_root_b)} is {guard.root_identity!r}: "
+                f"it was moved or replaced. Nothing is rolled back and nothing "
+                f"is started. Find the original tree, or inspect it by hand "
+                f"and remove the journal"
             )
-            # Only when the stop is the ONLY reason. A spill that could not
-            # be made, or a record that could not be written, has already set
-            # directory_times_incomplete - and marking that as "deferred by
-            # the stop" turned a real failure into exit 2, "just resume it".
-            if not directory_times_incomplete.is_set():
-                directory_times_deferred_by_stop.set()
-            directory_times_incomplete.set()
-        # Nothing reads a spilled file back yet, so leaving it behind would
-        # only litter the working directory with a name nobody can match to a
-        # run.
-        log_object.discard()
-        return
-
-    try:
-        outcome = repair_directory_times(log_object, get_config_snapshot())
-    except Exception as exc:
-        log(f"WARNING: directory timestamp repair failed: {exc}")
-        directory_times_incomplete.set()
-        return
-
-    if run_stats is not None:
-        run_stats["directory_times_applied"] = outcome["applied"]
-        run_stats["directory_times_failed"] = outcome["failed"]
-
-    if outcome["failed"]:
-        directory_times_incomplete.set()
-
     log(
-        f"directory timestamps restored: applied={outcome['applied']} "
-        f"failed={outcome['failed']} records={outcome['records']} "
-        f"threads={outcome['threads']} compression={log_object.compression}"
+        f"destination journal of an interrupted run found: rolling back the "
+        f"original directory values before locking"
+    )
+    cfg = get_config_snapshot()
+    # Streamed into a log bounded by metadata_maxsize, spilled above it: the
+    # journal of a very large tree is never loaded as a whole.
+    rollback_log = MetadataLog(
+        int(cfg.get("metadata_maxsize") or 100 * 1024 * 1024),
+        cfg.get("spill_compression") or "zlib",
+        cfg.get("dst_root"),
+        label="dstrollback",
+    )
+    try:
+        for body in bodies:
+            framed = bytearray()
+            _put_varint(framed, len(body))
+            framed += body
+            rollback_log.record_raw(bytes(framed))
+        rollback_log.close()
+        if rollback_log.spill_refused:
+            raise RuntimeError(
+                "the rollback records exceed metadata_maxsize and cannot be "
+                "spilled; the journal is kept"
+            )
+        outcome = restore_directories(rollback_log, cfg, rollback=True)
+    finally:
+        rollback_log.discard()
+    if outcome["failed"]:
+        raise RuntimeError(
+            f"rollback of the interrupted run failed for {outcome['failed']} "
+            f"directories; the journal is kept. Fix the cause and start again"
+        )
+    DestinationJournal.discard_existing(guard.dst_root_b)
+    log(
+        f"destination journal rolled back: {outcome['applied']} directories; "
+        f"{outcome['skipped']} skipped because they were changed or replaced "
+        f"since, {outcome['missing']} gone"
     )
 
-    if not outcome["failed"]:
-        log_object.discard()
+
+def finalize_destination_metadata(apply_restore: bool, run_stats: Optional[dict] = None) -> None:
+    """Close the logs and, when nothing writes any more, restore everything.
+
+    Also after a stop: leaving the tree locked would be worse than restoring
+    directories that are not yet complete. A resumed run locks them again and
+    records the restored values as their originals, which is exactly right.
+
+    apply_restore=False is for a run that cannot be sure its writers are gone.
+    The directories then stay locked and the journal is kept, so the next
+    start rolls back what the lock changed.
+    """
+    global destination_guard, destination_metadata_log, destination_file_metadata_log
+
+    guard = destination_guard
+    if guard is None:
+        return
+    dir_log = destination_metadata_log
+    file_log = destination_file_metadata_log
+    # From here on nothing records any more.
+    destination_metadata_log = None
+    destination_file_metadata_log = None
+
+    for log_object in (dir_log, file_log):
+        if log_object is None:
+            continue
+        try:
+            log_object.close()
+        except Exception as exc:
+            log(f"WARNING: cannot close destination metadata log: {exc}")
+            metadata_restore_incomplete.set()
+
+    if run_stats is not None:
+        run_stats["destination_protection_summary"] = guard.summary()
+
+    if not apply_restore:
+        metadata_restore_incomplete.set()
+        guard.journal.close_keep()
+        # The dst_root descriptor is deliberately NOT closed: it carries the
+        # run lock, and a worker that may still be writing must never write
+        # without it. Another run would otherwise take the lock, roll back
+        # this run's journal and restore under a live writer. The kernel drops
+        # the lock when this process ends - which also ends its worker
+        # threads - and once every child still holding a duplicate of the
+        # descriptor (rsync, an external copy engine) has exited.
+        log(
+            "WARNING: destination metadata was NOT restored because workers "
+            "may still be writing. Destination directories stay locked (0700). "
+            "The run lock on dst_root stays held until this process and its "
+            "writing child processes have exited; the next start with this "
+            "dst_root then rolls back what the lock changed, and a re-run "
+            "restores the rest"
+        )
+        destination_guard = None
+        global _abandoned_guard
+        _abandoned_guard = guard
+        return
+
+    cfg = get_config_snapshot()
+    try:
+        files = restore_files(file_log, cfg)
+        directories = restore_directories(dir_log, cfg)
+    except Exception as exc:
+        log(f"WARNING: destination metadata restore failed: {exc}")
+        metadata_restore_incomplete.set()
+        guard.journal.close_keep()
+        if run_stats is not None:
+            run_stats["destination_protection_summary"] = guard.summary()
+        destination_guard = None
+        guard.close()
+        return
+
+    if files["failed"] or directories["failed"]:
+        metadata_restore_incomplete.set()
+    if run_stats is not None:
+        run_stats["metadata_restore"] = {"files": files, "directories": directories}
+        run_stats["ownership_not_preserved_count"] = int(
+            run_stats.get("ownership_not_preserved_count", 0)
+        ) + files["ownership_not_preserved"] + directories["ownership_not_preserved"]
+        run_stats["destination_protection_summary"] = guard.summary()
+
+    log(
+        f"destination metadata restored: files applied={files['applied']} "
+        f"failed={files['failed']}; directories applied={directories['applied']} "
+        f"failed={directories['failed']} left_locked={directories['left_locked']}; "
+        f"protection={guard.status()} "
+        f"unlocked={guard.unlocked_count} violations={guard.violation_count}"
+    )
+
+    # The restore ran: what it could not do is reported above and in the
+    # statistics. Rolling the originals back on the next start would undo
+    # the values that WERE restored, so the journal goes either way.
+    guard.journal.remove()
+    for log_object in (dir_log, file_log):
+        if log_object is not None:
+            log_object.discard()
+    destination_guard = None
+    guard.close()
 
 
 def copy_one_openat_with_verify(
@@ -5768,10 +7449,12 @@ def copy_one_openat_with_verify(
 
         if rel_b == b".":
             # src_root itself, which 'find SRC -print0' emits as its first
-            # record. dst_root is created and owned by the configuration, not
-            # by the path mapping, so there is nothing to transfer for it. diff
-            # treats the same record the same way.
-            return 0, b"source root; nothing to transfer", 0
+            # record. dst_root exists already - the run opened and locked it
+            # at the start - so nothing is transferred; it takes the
+            # configured metadata of src_root in the restore, like every
+            # other directory.
+            record_root_final(cfg)
+            return 0, b"source root; metadata recorded", 0
 
         rel_parent_b = os.path.dirname(rel_b)
         leaf_b = os.path.basename(rel_b)
@@ -5816,30 +7499,11 @@ def copy_one_openat_with_verify(
 
             # Directory
             if stat.S_ISDIR(st.st_mode):
-                created = False
-                try:
-                    # Restrictive first, widened after the metadata is applied.
-                    os.mkdir(leaf_b, 0o700, dir_fd=dst_parent_fd)
-                    created = True
-                except FileExistsError:
-                    dst_st = os.stat(
-                        leaf_b,
-                        dir_fd=dst_parent_fd,
-                        follow_symlinks=False,
-                    )
-                    if not stat.S_ISDIR(dst_st.st_mode):
-                        return -1, (
-                            b"destination type mismatch: source is directory, "
-                            b"destination is " + file_type_name(dst_st.st_mode)
-                        ), 0
-
-                # O_NOFOLLOW on BOTH sides. The destination had it and the
-                # source did not, which is the wrong way round: the source is
-                # the side an attacker can aim somewhere else. lstat said
-                # "directory" a moment ago; between then and here the name can
-                # be a symlink to a directory outside src_root, and this open
-                # would follow it. What is read through the descriptor
-                # afterwards - the xattrs - would then come from out there.
+                # O_NOFOLLOW on the source as well: lstat said "directory" a
+                # moment ago, and between then and here the name can be a
+                # symlink to a directory outside src_root. What is read through
+                # the descriptor afterwards - the xattrs - would then come
+                # from out there.
                 dir_flags = (
                     os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
                 )
@@ -5859,23 +7523,21 @@ def copy_one_openat_with_verify(
                             b"source directory identity changed while opening "
                             b"it for copy"
                         ), 0
-                    dst_dir_fd = os.open(leaf_b, dir_flags, dir_fd=dst_parent_fd)
-
-                    if metadata_cfg is not None:
-                        # Same rule as for intermediate directories above.
-                        apply_metadata_fd(dst_dir_fd, st, metadata_cfg)
-                        if mtime_enabled(metadata_cfg):
-                            record_directory_times(rel_b, st)
-                    if metadata_cfg is None or not permissions_mode(metadata_cfg):
-                        if created:
-                            os.fchmod(dst_dir_fd, 0o777 & ~get_process_umask())
-
-                    if xattr_copy:
-                        copy_xattrs_fd(
-                            src_dir_fd, dst_dir_fd, prune_extra=True
+                    try:
+                        # Locked and recorded; the final metadata follows in
+                        # the restore at the end of the run.
+                        dst_dir_fd, created = prepare_destination_directory(
+                            dst_parent_fd, leaf_b, rel_b, opened_src_st,
+                            src_dir_fd, metadata_cfg,
                         )
-
-                    fsync_if_per_file(cfg, dst_dir_fd)
+                    except NotADirectoryError:
+                        dst_st = os.stat(
+                            leaf_b, dir_fd=dst_parent_fd, follow_symlinks=False
+                        )
+                        return -1, (
+                            b"destination type mismatch: source is directory, "
+                            b"destination is " + file_type_name(dst_st.st_mode)
+                        ), 0
                 finally:
                     if src_dir_fd is not None:
                         try:
@@ -6312,13 +7974,26 @@ def copy_one_external_with_verify(
                 )
 
             argv = expand_copy_engine_argv(engine, engine_source, engine_destination)
-            proc = subprocess.run(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=timeout,
-                pass_fds=trusted_exec_fds() + (src_fd, tmp_fd),
+            # A duplicate of the locked dst_root descriptor goes along, unused
+            # by the engine: flock() belongs to the open file, so the run lock
+            # then lasts as long as an engine that outlives this process
+            # could still be writing.
+            lock_fd = (
+                destination_guard.open_root()
+                if destination_guard is not None else None
             )
+            try:
+                proc = subprocess.run(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    timeout=timeout,
+                    pass_fds=trusted_exec_fds() + (src_fd, tmp_fd)
+                    + ((lock_fd,) if lock_fd is not None else ()),
+                )
+            finally:
+                if lock_fd is not None:
+                    os.close(lock_fd)
         except subprocess.TimeoutExpired:
             return -1, f"timeout copying {path_display(src_b)}".encode()
         except Exception as e:
@@ -6500,6 +8175,7 @@ def process_copy_batch(paths: List[bytes], cfg: dict) -> dict:
     # 'find -print0' is grouped by directory, so consecutive paths of a batch
     # normally share their parent and resolve it exactly once instead of once
     # per file.
+    prelock_batch(paths, cfg)
     parent_fd_cache = ParentDirFdCache(
         os.fsencode(cfg["src_root"]),
         os.fsencode(cfg["dst_root"]),
@@ -6603,7 +8279,16 @@ def process_copy_batch(paths: List[bytes], cfg: dict) -> dict:
                 # parent decides whether this object is already what the run
                 # would write. With skip_existing=false the branch is a single
                 # comparison and issues no syscall at all.
-                if skip_existing and st is not None and rel_b != b".":
+                # Never for a directory: it is cheap to process, and it has to
+                # be locked and recorded whether or not its metadata already
+                # matches - children copied later still reset its mtime, and
+                # the restore at the end must know it exists.
+                if (
+                    skip_existing
+                    and st is not None
+                    and rel_b != b"."
+                    and not stat.S_ISDIR(st.st_mode)
+                ):
                     try:
                         skip_src_parent_fd, skip_dst_parent_fd = (
                             parent_fd_cache.get(os.path.dirname(rel_b))
@@ -6616,12 +8301,6 @@ def process_copy_batch(paths: List[bytes], cfg: dict) -> dict:
                             cfg,
                             compare_mode,
                         ):
-                            if stat.S_ISDIR(st.st_mode) and mtime_enabled(cfg):
-                                # Not written here, but children copied later
-                                # reset its mtime all the same. Without this
-                                # record the final repair does not know the
-                                # directory exists.
-                                record_directory_times(rel_b, st)
                             skipped_count += 1
                             continue
                     except OSError:
@@ -6744,7 +8423,7 @@ def process_copy_batch(paths: List[bytes], cfg: dict) -> dict:
         base.update({
             "status": "stopped",
             "message": "stopped; unprocessed files requeued",
-            "failed_count": len(failed_files),
+            "failed_count": count_failed_input_records(paths, failed_files, cfg),
             "failed_files": {
                 path_display(path_b): msg.decode(errors="replace")
                 for path_b, msg in failed_files.items()
@@ -6771,7 +8450,9 @@ def process_copy_batch(paths: List[bytes], cfg: dict) -> dict:
     base.update({
         "status": "failed",
         "message": "errors",
-        "failed_count": len(failed_files),
+        "failed_count": count_failed_input_records(
+            paths, failed_files, cfg
+        ),
         "failed_files": {
             path_display(path_b): msg.decode(errors="replace")
             for path_b, msg in failed_files.items()
@@ -6814,6 +8495,11 @@ def build_rsync_verification_cfg(cfg: dict, compare_mode: str) -> dict:
     verify_cfg["method"] = "diff"
     verify_cfg["verify"] = compare_mode
     verify_cfg.pop("_hardlink_group_task", None)
+    # Owner, mode, ACL and xattrs are applied by the restore at the end of the
+    # run, not by rsync, so right after a batch they are not there yet and
+    # comparing them would report every file. File times ARE set by rsync.
+    verify_cfg["permissions"] = ""
+    verify_cfg["xattr"] = False
     # A directory's mtime is a record of the last entry created in it, so while
     # other workers are still writing into the same destination directories its
     # value is meaningless. Checking it per batch would report races, not
@@ -6862,23 +8548,49 @@ def process_rsync_batch(paths: List[bytes], cfg: dict) -> dict:
 
     # rsync --timeout=N aborts on N seconds without I/O. This is a real
     # inactivity watchdog, unlike a total-duration check after the fact.
+    # The destination is handed to rsync as the descriptor this run holds for
+    # dst_root, not as its name: whatever happens to the name during the run,
+    # rsync writes into the directory that was checked and locked at the
+    # start. The source is still a name - see the README on rsync resolving
+    # source paths again.
+    rsync_root_fd = None
+    if destination_guard is not None:
+        rsync_root_fd = open_destination_root(dst_root_b)
+        rsync_destination_b = os.fsencode(f"/proc/self/fd/{rsync_root_fd}/")
+    else:
+        rsync_destination_b = dst_root_b + b"/"
     cmd = [os.fsencode(resolve_trusted_executable("rsync"))] + operative_parameters + [
         b"--files-from=-", b"-0", b"--stats",
         f"--timeout={int(math.ceil(zero_bytes_timeout))}".encode("ascii"),
-        src_root_b + b"/", dst_root_b + b"/",
+        src_root_b + b"/", rsync_destination_b,
     ]
+    rsync_pass_fds = trusted_exec_fds() + (
+        (rsync_root_fd,) if rsync_root_fd is not None else ()
+    )
+    try:
+        return _process_rsync_batch_with_cmd(
+            paths, cfg, cmd, rsync_pass_fds, retries, backoff_base, backoff_max,
+            src_root_b, dst_root_b, timeout, xattr_copy, max_path_policy,
+        )
+    finally:
+        if rsync_root_fd is not None:
+            os.close(rsync_root_fd)
 
-    t0 = time.time()
-    env = dict(os.environ)
-    env["LC_ALL"] = "C"
 
-    rsync_paths = []
-    rsync_input_paths = []
-    # (original input, absolute source, absolute destination)
-    internal_long_paths = []
-    path_length_errors = {}
-    input_errors = {}
-
+def _process_rsync_batch_with_cmd(
+    paths: List[bytes],
+    cfg: dict,
+    cmd: List[bytes],
+    rsync_pass_fds: Tuple[int, ...],
+    retries: int,
+    backoff_base: float,
+    backoff_max: float,
+    src_root_b: bytes,
+    dst_root_b: bytes,
+    timeout,
+    xattr_copy: bool,
+    max_path_policy,
+) -> dict:
     # rsync resolves the names it is handed itself, and it follows symlinks in
     # the intermediate components of a source path. A directory replaced by a
     # symlink between the listing and the transfer would therefore be read
@@ -6927,6 +8639,88 @@ def process_rsync_batch(paths: List[bytes], cfg: dict) -> dict:
         checked_source_parents[rel_parent_b] = cached
         return cached
 
+    # Destination side, before rsync sees anything: every parent chain is
+    # created and locked by this program, a directory named in the batch is
+    # created and locked itself, and the metadata every file and symlink must
+    # get at the end is recorded from the source. rsync then only ever writes
+    # into locked directories and never creates one.
+    parent_fd_cache = ParentDirFdCache(src_root_b, dst_root_b, xattr_copy, cfg)
+    root_recorded = False
+    # rsync skips existing destination FILES with --ignore-existing (never
+    # for a resolved hard-link group). Existing directories still get their
+    # metadata from rsync in that mode, so they are recorded as usual.
+    skip_existing_files = bool(cfg.get("ignore_existing", False)) and not bool(
+        cfg.get("_hardlink_group_task", False)
+    )
+    prelock_batch(paths, cfg)
+
+    def prepare_destination(rel_b: bytes) -> bytes:
+        nonlocal root_recorded
+        if destination_guard is None:
+            return b""
+        try:
+            if rel_b == b".":
+                if not root_recorded:
+                    record_root_final(cfg)
+                    root_recorded = True
+                return b""
+            src_parent_fd, dst_parent_fd = parent_fd_cache.get(
+                os.path.dirname(rel_b)
+            )
+            leaf_b = os.path.basename(rel_b)
+            try:
+                leaf_st = os.lstat(leaf_b, dir_fd=src_parent_fd)
+            except FileNotFoundError:
+                # Vanished: rsync reports it the way it always has.
+                return b""
+            if stat.S_ISDIR(leaf_st.st_mode):
+                parent_fd_cache.get(rel_b)
+                return b""
+            if skip_existing_files:
+                # --ignore-existing leaves an existing destination file
+                # completely alone, its metadata included, so nothing may be
+                # recorded for it either. The answer cannot change before
+                # rsync looks: the parent is locked, and only this run can
+                # add or remove entries in it.
+                try:
+                    os.lstat(leaf_b, dir_fd=dst_parent_fd)
+                    return b""
+                except FileNotFoundError:
+                    pass
+            record_file_final(rel_b, leaf_st, src_parent_fd, leaf_b, cfg)
+        except OSError as exc:
+            return (
+                f"cannot prepare the destination for "
+                f"{path_display(rel_b)}: {exc}"
+            ).encode(errors="replace")
+        return b""
+
+    try:
+        return _run_rsync_batch(
+            paths, cfg, cmd, rsync_pass_fds, retries, backoff_base,
+            backoff_max, src_root_b, timeout, xattr_copy, max_path_policy,
+            source_parent_error, prepare_destination,
+        )
+    finally:
+        parent_fd_cache.close()
+
+
+def _run_rsync_batch(
+    paths, cfg, cmd, rsync_pass_fds, retries, backoff_base, backoff_max,
+    src_root_b, timeout, xattr_copy, max_path_policy,
+    source_parent_error, prepare_destination,
+) -> dict:
+    t0 = time.time()
+    env = dict(os.environ)
+    env["LC_ALL"] = "C"
+
+    rsync_paths = []
+    rsync_input_paths = []
+    # (original input, absolute source, absolute destination)
+    internal_long_paths = []
+    path_length_errors = {}
+    input_errors = {}
+
     for src_b in paths:
         try:
             rel_b, src_abs_b, dst_b = normalize_input_path(src_b, cfg)
@@ -6952,6 +8746,10 @@ def process_rsync_batch(paths: List[bytes], cfg: dict) -> dict:
             parent_error = source_parent_error(os.path.dirname(rel_b))
             if parent_error:
                 input_errors[src_abs_b] = parent_error
+                continue
+            destination_error = prepare_destination(rel_b)
+            if destination_error:
+                input_errors[src_abs_b] = destination_error
                 continue
             # max_path_length="rsync": delegate even technically long paths to
             # rsync unchanged.  Numeric max_path_length also reaches this path
@@ -7028,7 +8826,7 @@ def process_rsync_batch(paths: List[bytes], cfg: dict) -> dict:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=env,
-                pass_fds=trusted_exec_fds(),
+                pass_fds=rsync_pass_fds,
                 # A local rsync is three processes: the invocation forks a
                 # server child, and the receiver forks the generator. Killing
                 # only the one this program started leaves the other two
@@ -7190,12 +8988,19 @@ def process_rsync_batch(paths: List[bytes], cfg: dict) -> dict:
         if verification.get("failed_files"):
             result["verify_failed_files"] = verification["failed_files"]
 
+    # The count and the display list are two different things, and conflating
+    # them lost failures here. The list is deduplicated on purpose - the same
+    # path has the same reason and repeating it helps nobody - but the count
+    # has to stay one per INPUT RECORD, or a path listed twice and failing
+    # twice is reported as one failure and one transferred object.
+    failed_records = 0
     failed_files = []
     if status == "failed" and not success:
+        failed_records += len(rsync_input_paths)
         failed_files.extend(path_display(src_b) for src_b in rsync_input_paths)
-    failed_files.extend(path_display(path_b) for path_b in openat_failed)
-    failed_files.extend(path_display(path_b) for path_b in path_length_errors)
-    failed_files.extend(path_display(path_b) for path_b in input_errors)
+    for quelle in (openat_failed, path_length_errors, input_errors):
+        failed_records += count_failed_input_records(paths, quelle, cfg)
+        failed_files.extend(path_display(path_b) for path_b in quelle)
     if failed_files:
         # Preserve order while avoiding duplicates.
         failed_files = list(dict.fromkeys(failed_files))
@@ -7205,7 +9010,7 @@ def process_rsync_batch(paths: List[bytes], cfg: dict) -> dict:
     # names that went into the failing call. Without this field the run-level
     # accounting reads failed_count=0 from every rsync batch and counts a
     # batch that transferred nothing as a batch of successful objects.
-    result["failed_count"] = len(failed_files)
+    result["failed_count"] = failed_records
 
     return result
 
@@ -8115,8 +9920,13 @@ def partition_normal_batch_for_hardlinks(paths: List[bytes], cfg: dict) -> dict:
         stat_key = (int(source_st.st_dev), int(source_st.st_ino))
         if stat_key in local_groups:
             group = local_groups[stat_key]
-            if input_path_b not in group["input_paths"]:
-                group["input_paths"].append(input_path_b)
+            # Every input record, repetitions included. This used to skip a
+            # name already present, so a batch that deferred two records
+            # handed on a group carrying one - and the run-level accounting
+            # was then short by exactly the records that were dropped here.
+            # A repeated name is the operator's business; losing track of it
+            # is not.
+            group["input_paths"].append(input_path_b)
             deferred_input_count += 1
             continue
         if stat_key in local_failures:
@@ -9006,7 +10816,9 @@ def process_migrate_batch(paths: List[bytes], cfg: dict) -> dict:
         "bytes_total": total,
         "duration_sec": round(duration, 3),
         "bytes_per_sec": round(bytes_per_sec, 2),
-        "failed_count": len(failed_files),
+        "failed_count": count_failed_input_records(
+            paths, failed_files, cfg
+        ),
         "failed_files": {path_display(src_b): msg.decode(errors="replace") for src_b, msg in failed_files.items()},
         "requeued_count": requeued_count,
         "path_length_error_count": path_length_error_count,
@@ -9270,7 +11082,9 @@ def _process_diff_batch_cached(
         "bytes_total": total,
         "verify": compare_mode,
         "duration_sec": round(duration, 3),
-        "failed_count": len(failed_files),
+        "failed_count": count_failed_input_records(
+            paths, failed_files, cfg
+        ),
         "requeued_count": requeued_count,
         "path_length_error_count": path_length_error_count,
         "failed_files": {
@@ -9538,8 +11352,6 @@ def create_or_replace_destination_hardlink(
     link_leaf_b = os.path.basename(link_rel_b)
     tmp_b = None
     tmp_exists = False
-    link_parent_times = None
-    directory_modified = False
 
     try:
         primary_parent_fd = open_dst_dir_fd_with_attrs(
@@ -9557,20 +11369,10 @@ def create_or_replace_destination_hardlink(
             metadata_cfg,
         )
 
-        # Creating an alias is an entry creation, so it sets the mtime of the
-        # directory it happens in - after the transfer method has already
-        # finished and restored that value. The hard-link phase runs last, so
-        # nobody would correct it afterwards: rsync's run is over, and
-        # directory_times_file is a copy-only mechanism. The alias creation is
-        # therefore made neutral here, by putting back exactly the timestamps
-        # the directory had before it.
-        link_parent_times = None
-        if mtime_enabled(cfg):
-            link_parent_st = os.fstat(link_parent_fd)
-            link_parent_times = (
-                link_parent_st.st_atime_ns,
-                link_parent_st.st_mtime_ns,
-            )
+        # Creating an alias sets the mtime of the directory it happens in.
+        # That needs no care here: both parents were walked above, so they are
+        # locked and recorded, and their times are set by the restore at the
+        # end, after this phase.
 
         primary_st = os.stat(
             primary_leaf_b,
@@ -9623,25 +11425,14 @@ def create_or_replace_destination_hardlink(
             dst_dir_fd=link_parent_fd,
         )
         tmp_exists = False
-        directory_modified = True
         fsync_if_per_file(cfg, link_parent_fd)
     finally:
         try:
             if tmp_exists and tmp_b is not None:
-                directory_modified = True
                 try:
                     os.unlink(tmp_b, dir_fd=link_parent_fd)
                 except FileNotFoundError:
                     pass
-            if directory_modified and link_parent_times is not None:
-                try:
-                    os.utime(link_parent_fd, ns=link_parent_times)
-                except OSError as exc:
-                    log(
-                        f"WARNING: cannot restore the timestamps of the "
-                        f"destination directory of "
-                        f"{path_display(destination_link_b)}: {exc}"
-                    )
         finally:
             for parent_fd in (primary_parent_fd, link_parent_fd):
                 if parent_fd is not None:
@@ -10404,9 +12195,16 @@ def _hardlink_group_signature(group: dict):
 
 
 def collect_resolved_hardlink_groups(groups_by_identity: dict) -> Tuple[int, int, int]:
-    """Drain worker discoveries and merge duplicate fully resolved groups."""
+    """Drain worker discoveries and merge duplicate fully resolved groups.
+
+    The middle return value counts MERGED GROUP RESOLUTIONS - how often two
+    workers independently resolved the same inode. That is a useful number for
+    the log and it is not a count of dropped input records; it was once used
+    as one, and the accounting then depended on how the input happened to be
+    split into batches.
+    """
     collected = 0
-    duplicates = 0
+    merged_group_resolutions = 0
     conflicts = 0
 
     while True:
@@ -10423,12 +12221,18 @@ def collect_resolved_hardlink_groups(groups_by_identity: dict) -> Tuple[int, int
                 groups_by_identity[identity_key] = group
                 continue
 
-            duplicates += 1
-            merged_inputs = sorted(
-                set(existing.get("input_paths", ()))
-                | set(group.get("input_paths", ()))
+            # Two workers resolved the same inode, each from the record it
+            # was given. Concatenate: both records exist and both must be
+            # accounted for. A set union lost that - two DIFFERENT names of
+            # one inode, discovered in separate batches, produced one merged
+            # group and a "duplicate" that had dropped nothing, so a complete
+            # run reported an unbalanced accounting and exited 1. How the
+            # input happens to be split into batches must not decide whether
+            # a run is called a success.
+            merged_group_resolutions += 1
+            existing["input_paths"] = list(existing.get("input_paths", ())) + list(
+                group.get("input_paths", ())
             )
-            existing["input_paths"] = merged_inputs
 
             if _hardlink_group_signature(existing) != _hardlink_group_signature(group):
                 conflicts += 1
@@ -10439,7 +12243,7 @@ def collect_resolved_hardlink_groups(groups_by_identity: dict) -> Tuple[int, int
         finally:
             hardlink_group_queue.task_done()
 
-    return collected, duplicates, conflicts
+    return collected, merged_group_resolutions, conflicts
 
 
 def emit_results(run_stats: Optional[dict] = None) -> None:
@@ -10532,6 +12336,10 @@ def emit_final_statistics(
     unstarted = int(run_stats.get("unstarted_path_count", 0))
     accounted = total_objects + total_failed + unstarted
 
+    merged_group_resolutions = int(
+        run_stats.get("hardlink_merged_group_resolutions", 0) or 0
+    )
+
     record = {
         "statistics": {
             "total_size_bytes": total_size,
@@ -10548,11 +12356,20 @@ def emit_final_statistics(
             # result at all.
             "unstarted_path_count": unstarted,
             "unstarted_paths_saved": bool(run_stats.get("unstarted_paths_saved", False)),
-            # object + failed + unstarted, and whether that equals the number
-            # of accepted input records. A mismatch is not by itself an error
-            # - duplicate input records that end up in the same hard-link
-            # group are counted once here and twice on the way in - but it is
-            # the one number worth looking at before a run is called complete.
+            # How often two workers resolved the same inode independently.
+            # Informational: it depends on batch boundaries and says nothing
+            # about how many records exist.
+            "hardlink_merged_group_resolutions": merged_group_resolutions,
+            # object + failed + unstarted, against the accepted records.
+            #
+            # A plain sum, because every input record is now represented
+            # exactly once: a hard-link group carries each record that named
+            # it, repetitions included. Two earlier versions got this wrong in
+            # opposite directions - one dropped repeated names from the group
+            # and came out short, the other added a "duplicate" for every
+            # merged group resolution and came out long, which failed complete
+            # runs. false means what it says: this run cannot account for
+            # every record it accepted.
             "accounted_path_count": accounted,
             "path_accounting_balanced": accounted == input_records,
             # Objects whose owner/group could not be applied because the
@@ -10561,18 +12378,17 @@ def emit_final_statistics(
                 run_stats.get("ownership_not_preserved_count", 0)
             ),
             "input_complete": not input_failed_event.is_set(),
-            "directory_times_applied": int(
-                run_stats.get("directory_times_applied", 0)
+            # What the restore at the end did, split into files (rsync only)
+            # and directories. "missing" are files whose transfer failed or
+            # never happened; they were reported as failed paths already.
+            "metadata_restore": run_stats.get("metadata_restore"),
+            # The one field to test: a record that could not be written, a
+            # restore that failed or never ran.
+            "metadata_restore_incomplete": metadata_restore_incomplete.is_set(),
+            "directories_left_locked": int(
+                ((run_stats.get("metadata_restore") or {}).get("directories") or {})
+                .get("left_locked", 0)
             ),
-            "directory_times_failed": int(
-                run_stats.get("directory_times_failed", 0)
-            ),
-            # The counters above only cover a repair that ran. A run that was
-            # stopped before the repair, or one whose records could not be
-            # spilled, reports zero applied and zero failed - and the exit
-            # status was the only trace of it. This flag is the one field to
-            # test.
-            "directory_times_incomplete": directory_times_incomplete.is_set(),
             "total_time_sec": round(total_time, 3),
             "total_performance_bytes_per_sec": round(total_performance, 2),
             "total_performance_human": human_bytes(total_performance) + "/s",
@@ -10583,17 +12399,32 @@ def emit_final_statistics(
             "run_aborted": aborted is not None,
         }
     }
+    # How far the destination tree was actually protected while it was
+    # written: enforced, partial or not_enforced, with the reasons. Separate
+    # from the copy result and from the metadata result on purpose.
+    protection = run_stats.get("destination_protection_summary")
+    if protection is not None:
+        record["statistics"].update(protection)
+    else:
+        record["statistics"]["destination_protection"] = "not_applicable"
     if aborted is not None:
         record["statistics"]["run_abort_reason"] = (
             f"{type(aborted).__name__}: {aborted}"
         )
-    if accounted != input_records:
+    balanced = accounted == input_records
+    if not balanced:
         log(
             f"WARNING: path accounting does not add up: {input_records} input "
             f"records accepted, {accounted} accounted for "
             f"({total_objects} objects + {total_failed} failed + "
             f"{unstarted} never started)"
         )
+
+    # Back into run_stats, because the exit code is decided from there and a
+    # number that only exists inside the json record cannot influence it.
+    run_stats["total_input_record_count"] = input_records
+    run_stats["accounted_path_count"] = accounted
+    run_stats["path_accounting_balanced"] = balanced
 
     print(json.dumps(record, ensure_ascii=True), flush=True)
 
@@ -10609,6 +12440,11 @@ def new_run_stats() -> dict:
         "ownership_not_preserved_count": 0,
         "total_skipped_count": 0,
         "unstarted_path_count": 0,
+        # How often two workers independently resolved the same inode. A
+        # number for the log, NOT a term in the accounting: it says nothing
+        # about how many input records exist, and using it as if it did made
+        # the balance depend on how the input was split into batches.
+        "hardlink_merged_group_resolutions": 0,
     }
 
 
@@ -10652,6 +12488,9 @@ def scheduler_loop(
                 hardlink_groups
             )
             hardlink_duplicate_resolutions += duplicate_count
+            run_stats["hardlink_merged_group_resolutions"] = (
+                hardlink_duplicate_resolutions
+            )
             hardlink_conflicts += conflict_count
 
         emit_results(run_stats)
@@ -10724,7 +12563,10 @@ def scheduler_loop(
         # run short even though it had finished everything: the shutdown branch
         # was evaluated first, so the directory timestamps were dropped and the
         # run ended with status 1 although every object had been processed.
-        # Work that is genuinely complete is completed, signal or not.
+        # Work that is genuinely complete is completed, signal or not. That
+        # holds for the hard-link phase as well: a stop that arrived while the
+        # last group was finished as a unit left nothing to resume, yet it
+        # discarded every recorded directory timestamp and ended with exit 2.
         everything_done = (
             stdin_closed_event.is_set()
             and get_unfinished_tasks() == 0
@@ -10733,7 +12575,7 @@ def scheduler_loop(
         )
 
         if shutdown_event.is_set() and get_inflight_batches() == 0 and not (
-            everything_done and phase == "normal"
+            everything_done and phase in ("normal", "hardlink")
         ):
             if phase == "normal":
                 collect_resolved_hardlink_groups(hardlink_groups)
@@ -10745,12 +12587,12 @@ def scheduler_loop(
                         },
                         "shutdown before hard-link phase",
                     )
-            # Directories still have pending files, so a final timestamp now
-            # would be wrong. There is no resume yet: a spilled file carries a
-            # name nobody looks for, so it is discarded rather than left as
-            # litter, and the run reports the loss instead of claiming the
-            # records were kept.
-            finalize_directory_times(apply_repair=False)
+            # No batch is in flight any more, so nothing writes into the
+            # destination: the metadata is restored now, stop or not. Leaving
+            # the tree locked would be worse than giving directories that are
+            # not yet complete their final values; a resumed run locks them
+            # again and restores them again at its own end.
+            finalize_destination_metadata(apply_restore=True, run_stats=run_stats)
             break
 
         if (
@@ -10764,6 +12606,9 @@ def scheduler_loop(
                 hardlink_groups
             )
             hardlink_duplicate_resolutions += duplicate_count
+            run_stats["hardlink_merged_group_resolutions"] = (
+                hardlink_duplicate_resolutions
+            )
             hardlink_conflicts += conflict_count
 
             if hardlink_groups:
@@ -10803,14 +12648,14 @@ def scheduler_loop(
                 phase = "hardlink"
             else:
                 phase = "complete"
-                finalize_directory_times(apply_repair=True, run_stats=run_stats)
+                finalize_destination_metadata(apply_restore=True, run_stats=run_stats)
                 break
 
         elif phase == "hardlink" and get_unfinished_tasks() == 0:
             # Hard-link groups also write into destination directories, so the
-            # repair must wait until this phase is done as well.
+            # restore must wait until this phase is done as well.
             phase = "complete"
-            finalize_directory_times(apply_repair=True, run_stats=run_stats)
+            finalize_destination_metadata(apply_restore=True, run_stats=run_stats)
             break
 
         time.sleep(0.2)
@@ -11509,12 +13354,13 @@ COMMON JSON PARAMETERS
                          the same second out of each other's files, and the
                          timestamp makes leftovers sortable.
 
-  directory_times_maxsize
-                         byte count or size string, default "100MiB"
-                         How much COMPRESSED directory-timestamp data is held
-                         in memory before it is spilled into working_directory.
+  metadata_maxsize       byte count or size string, default "100MiB"
+                         (the former name directory_times_maxsize is accepted)
+                         How much COMPRESSED destination metadata is held in
+                         memory before it is spilled into working_directory.
                          Accepts bytes as an integer or a string with a unit:
-                         "100MiB", "512KiB", "2GB".
+                         "100MiB", "512KiB", "2GB". rsync splits it between
+                         the directory and the file records.
 
                          A compressor does not hand out every byte it is given
                          - deflate holds about a window's worth of input before
@@ -11522,30 +13368,32 @@ COMMON JSON PARAMETERS
                          already emitted plus the input still inside the codec.
                          Without that, a small limit would never be reached.
 
-                         Destination directory timestamps cannot be finalized
-                         while the copy runs: every file created inside a
-                         directory sets that directory's mtime to the current
-                         time again. The source values are therefore recorded
-                         and applied once, after the normal phase and the
-                         hard-link phase have finished. For method=copy with
-                         mtime=true this recording is always on - it used to
-                         require naming a file, and a run that did not name one
-                         silently produced a destination whose directory times
-                         were all wrong.
+                         What is recorded: copy and rsync keep the destination
+                         tree LOCKED while they write (see DESTINATION
+                         PROTECTION), so no directory receives its final owner,
+                         mode, ACL, xattrs or times during the run. Those values
+                         are recorded here and applied once, after the normal
+                         phase and the hard-link phase. For rsync the owner,
+                         mode, ACL and xattrs of every file and symlink are
+                         recorded as well.
 
-                         Measured on Lustre, a directory costs about 17 bytes
-                         compressed, so the default holds roughly six million
-                         of them before anything is written. Below that the run
-                         leaves nothing behind at all.
+                         The same limit bounds the external sort that orders
+                         the directories bottom-up for the restore.
 
-                         Above it, a file is created in working_directory. If
-                         there is none that can be used, recording STOPS there:
-                         growing without bound would trade a wrong timestamp
-                         for a dead machine. What was already held is still
-                         applied, the run says so, and it ends with status 1.
+                         Above the limit, a file is created in
+                         working_directory. If there is none that can be used,
+                         recording STOPS there: growing without bound would
+                         trade wrong metadata for a dead machine. What was
+                         already held is still applied, the run says so, and
+                         it ends with status 1.
+
+                         This is not a crash-safe journal. What must survive a
+                         crash - the original values of destination
+                         directories the lock changed - is journalled
+                         separately, see DESTINATION PROTECTION.
 
   spill_compression      "zlib" (default), "zstd", or "none"
-                         Compression of the directory-timestamp records,
+                         Compression of the destination metadata records,
                          in memory and in the spill file alike.
                          zlib:  standard library, gzip container, level 1.
                                 Measured ~6x smaller at ~185 MB/s. The file
@@ -11721,12 +13569,98 @@ METADATA: permissions, mtime, xattr
                          means every run is a full transfer. Use
                          ignore_existing or an rsync-side --size-only strategy
                          if that is what you want.
-                         Destination DIRECTORY timestamps are restored after
-                         the copy for method=copy; see directory_times_maxsize.
+                         Destination DIRECTORY timestamps are restored at the
+                         end of the run for copy and rsync (rsync runs with -O);
+                         see metadata_maxsize.
 
   xattr                  boolean, default false
                          Copy and verify, or for diff compare, all extended
-                         attributes.
+                         attributes, POSIX ACLs included. On destination
+                         directories, extra user.* attributes and ACLs are
+                         removed; other extra attributes make the restore of
+                         that directory fail rather than be removed unreviewed.
+
+  permissions, mtime and xattr cannot be changed by a reload: they decide what
+  is recorded for the restore at the end of the run.
+
+DESTINATION PROTECTION (copy, rsync)
+====================================
+
+  dst_root is opened once at the start and held for the whole run; every walk
+  below it starts from that descriptor, and rsync is handed the descriptor as
+  /proc/self/fd/N/, not the name. The chain of directories ABOVE dst_root must
+  be trustworthy: owned by root or this user and not writable by group or
+  other (the sticky bit excepted). Otherwise somebody could move dst_root away
+  and put another directory in its place.
+
+  While the run writes, every destination directory it touches is LOCKED:
+  owned by the user running the program, permissions 0700 (special bits are
+  kept, the group is left as it is - with no group permission it grants
+  nothing). New directories are created locked. Nobody else can reach
+  anything below a locked dst_root by path.
+
+  One run per destination: the run holds an exclusive flock() on dst_root
+  from the start until its restore is done. A second run on the same dst_root
+  is refused with exit status 1. If flock() fails - Lustre mounted without
+  -o flock or -o localflock - the run does not start. With -o localflock the
+  lock only covers runs on the same node. If workers are still busy when the
+  run ends, the restore is skipped and the lock is kept until the process and
+  its writing children (rsync, an external engine) have exited. A start that
+  fails removes the dst_root and parent directories it created itself, if
+  they are still empty and still the directories it created.
+
+  Directories are locked when the run first touches them. Before an existing
+  directory is changed, its original owner, mode and access ACL - and its
+  device and inode - are written to a journal in working_directory and
+  flushed to disk. The existing parent directories of a batch are locked
+  together with one flush; concurrent workers share flushes as well. Nothing
+  is recorded for a directory that is already locked, so a later batch can
+  never mistake the temporary 0700 for the original. Existing directories the
+  input never names stay as they are. Put working_directory on a local disk:
+  an fsync on Lustre is a server round trip.
+
+  At the end - after all batches and the hard-link phase, and also after a
+  stop - the restore runs: for rsync first the files and symlinks, then the
+  directories bottom-up, dst_root last, independent directories in parallel.
+  Each object gets, in this order: owner/group, xattrs, ACLs, mode, then a
+  check of all of them, then its times. A configured metadata class takes the
+  source value; for a class that is not configured, a directory gets back
+  the value it had before the lock. dst_root takes the metadata of src_root
+  when the input names src_root (find SRC -print0 does).
+
+  If the process dies, the journal stays. The next start with the same
+  dst_root and working_directory rolls the journalled originals back before
+  it locks anything, and refuses to start if that fails. Nothing is rolled
+  back onto another directory: if dst_root is not the journalled directory,
+  the start is refused and the journal kept; a directory below it that was
+  replaced or is no longer locked is skipped and reported. The journal is
+  streamed; metadata_maxsize bounds the rollback too. Directories the dead run created stay 0700
+  until a run over them restores them. With permissions lacking "p", the mode
+  such a directory should get cannot be known after a crash.
+
+  The statistics report how far the protection held:
+
+      destination_protection   enforced      everything the run touched was
+                                             locked, dst_root included
+                               partial       some directories could not be
+                                             locked (unprivileged run, foreign
+                                             owner) or were released during
+                                             the run
+                               not_enforced  dst_root itself could not be
+                                             locked, or its parent chain is
+                                             not trustworthy
+
+  require_destination_protection
+                         boolean, default false (copy, rsync)
+                         false: anything but "enforced" is a warning in the
+                         log and the statistics. true: it ends the run with
+                         exit status 1.
+
+  A directory whose restore fails can stay 0700; it is named in the log with
+  its path in base64, and directories_left_locked counts it.
+
+  The lock protects the destination. It does not stop rsync from resolving
+  SOURCE names again; see the README.
 
 VERIFY MODES
 ============
@@ -11778,10 +13712,10 @@ VERIFY MODES
           threads_per_hasher = min(4, max(1, (NCPU - 1) // max_workers))
 
   For rsync, every mode other than null and size_iferr runs the diff engine
-  over the transferred paths after rsync returns. It inherits permissions,
-  mtime and xattr from the rsync configuration, so the check asks for exactly
-  what the transfer was configured to produce. This reads the data a second
-  time on both sides.
+  over the transferred paths after rsync returns. It inherits mtime from the
+  rsync configuration, but not permissions and xattr: those are applied by
+  the restore at the end of the run, so right after a batch they are not
+  there yet. This reads the data a second time on both sides.
 
   That inline check deliberately skips DIRECTORY metadata. A directory's mtime
   records when an entry was last created in it, so while other workers still
@@ -11992,8 +13926,10 @@ COPY PARAMETERS
                          parent directory: type, size and every configured
                          metadata class come from that single call. When they
                          all match, the object is counted as skipped_count and
-                         nothing is written. Applies to files, symlinks and
-                         directories.
+                         nothing is written. Applies to files and symlinks.
+                         Directories are always processed: they have to be
+                         locked and recorded for the restore at the end
+                         whether or not their metadata already matches.
 
                          This is what makes a stopped job resumable even when
                          the input came from a running "find": re-run find from
@@ -12081,14 +14017,26 @@ RSYNC PARAMETERS
                          passed directly to rsync.
   verify                  default "size_iferr"; see VERIFY MODES above
   buffer_mb               default 8; used only by the hash verify modes
-  permissions             default "pog"; adds -p, -o and -g individually
-  mtime                   boolean, default true; adds -t
+  permissions             default "pog"; NOT passed to rsync. Owner, group
+                          and mode of files, symlinks and directories are
+                          recorded and applied by the restore at the end,
+                          while the directories stay locked during the run.
+                          rsync runs with --chmod=D0700.
+  mtime                   boolean, default true; adds -t for files and -O:
+                          directory times are set by the restore at the end
   xattr                   boolean, default false
-                          Run rsync with -X.
+                          Not passed to rsync either (-X is not used): xattrs
+                          and ACLs are recorded and applied at the end.
+  require_destination_protection
+                          boolean, default false; see DESTINATION PROTECTION
   sparse                  boolean, default false
                           Run rsync with --sparse so runs of zero bytes become
                           holes at the destination instead of allocated blocks.
   ignore_existing         boolean, default false
+                          Existing destination files keep their metadata as
+                          well: nothing is recorded for them. Existing
+                          directories still get the source values, as rsync
+                          does in this mode.
                           Run rsync with --ignore-existing, which skips every
                           destination name that already exists. This trades
                           correctness for speed: an existing but outdated or
@@ -12419,11 +14367,16 @@ FINAL STATISTICS AND EXIT CODES
                              Written to remaining_tasks_file when configured;
                              unstarted_paths_saved says whether that happened.
   accounted_path_count       The sum of the three buckets.
-  path_accounting_balanced   Whether that sum equals the reference. A false
-                             here is worth investigating but is not by itself
-                             an error: duplicate input records that land in the
-                             same hard-link group are counted once on the way
-                             out and twice on the way in.
+  hardlink_merged_group_resolutions
+                             How often two workers resolved the same inode
+                             independently. Informational only: it depends on
+                             where the batch boundaries fell and says nothing
+                             about how many input records there were.
+  path_accounting_balanced   Whether the three buckets equal the reference.
+                             Every input record is represented exactly once,
+                             repeated names included, so a false here means
+                             the run cannot account for a record it accepted -
+                             and the run exits 1 for it.
   input_complete             False when the input stream ended abnormally.
   run_aborted                False for every run that reached its own end -
                              successful, failed or stopped alike. True only
@@ -12446,18 +14399,19 @@ FINAL STATISTICS AND EXIT CODES
       tr -cd '\\0' < list.txtz | wc -c      # records in the list
       jq .statistics.total_input_record_count run.jsonlog | tail -1
 
-  directory_times_incomplete is true in both cases below, but they end
-  differently on purpose: a run STOPPED before the repair could run exits 2
-  ("you stopped it, resume it"), because that is a consequence of the stop and
-  not a fault. A repair that ran and failed, or a record that could not be
-  written at all, exits 1.
+  metadata_restore_incomplete is true when a metadata record could not be
+  written, or the restore at the end failed or could not run. It always ends
+  the run with exit status 1. A STOPPED run still restores: no batch is in
+  flight any more at that point, and leaving the tree locked would be worse.
 
   Exit codes:
 
       0   Input read completely, nothing failed, nothing left over.
       1   Something failed: input incomplete, failed paths, unsaved work,
-          directory timestamps not restored, a flush that did not succeed, or
-          owner/group that could not be applied.
+          destination metadata not restored, a flush that did not succeed,
+          owner/group that could not be applied, or - with
+          require_destination_protection - a destination that was not fully
+          protected.
       2   The run stopped early. Nothing failed, but stopped_batch_count or
           unstarted_path_count is non-zero, so work remains to be done.
 """
@@ -12614,7 +14568,7 @@ Common:
   hard_link            null
   spill_compression    "zlib"
   working_directory    ".parallel_tool_workdir"
-  directory_times_maxsize "100MiB"
+  metadata_maxsize     "100MiB"
 
 rsync additionally:
   method                   "rsync"
@@ -12631,6 +14585,7 @@ rsync additionally:
   sparse                   false
   fsync                    "hourly"
   ignore_existing          false
+  require_destination_protection false
   src_root                 "/src"
   dst_root                 "/dst"
 
@@ -12646,6 +14601,7 @@ copy additionally:
   mtime                    true
   sparse                   false
   fsync                    "hourly"
+  require_destination_protection false
   src_root                 "/src"
   dst_root                 "/dst"
 
@@ -12853,36 +14809,40 @@ def main() -> int:
     warn_if_hash_threads_exceed_cpu_budget(initial_cfg)
     warn_if_buffer_exceeds_memory_budget(initial_cfg)
 
-    # Always on where it applies. diff and migrate never write destination
-    # directories, so they need none of this.
-    #
-    # rsync does restore directory timestamps itself - but only for what IT
-    # wrote, and only at the end of its own run. The hard-link phase comes
-    # afterwards and is done by this program: creating z/deep/alias resets the
-    # mtime of z/deep, and creating z/deep resets the mtime of z. The
-    # directories the walk creates get their metadata immediately, which is
-    # why the immediate parent looked right and its parent did not. So the log
-    # is needed for rsync too, whenever a hard-link mode will reconstruct
-    # aliases.
-    needs_directory_times = initial_cfg.get("mtime", False) and (
-        initial_cfg["method"] == "copy"
-        or (
-            initial_cfg["method"] == "rsync"
-            and initial_cfg.get("hard_link") in HARD_LINK_PRESERVE_MODES
+    # copy and rsync write into the destination, and they do so into a
+    # locked tree: dst_root is opened once and held, the directories are
+    # locked, and the metadata they - and for rsync the files - must carry
+    # is recorded and applied at the end. diff and migrate write no
+    # destination directories and need none of this.
+    if initial_cfg["method"] in ("copy", "rsync"):
+        global destination_guard, destination_metadata_log
+        global destination_file_metadata_log
+        maxsize = int(initial_cfg["metadata_maxsize"])
+        if initial_cfg["method"] == "rsync":
+            # Two logs share the budget: directories, and rsync's files.
+            maxsize = max(1, maxsize // 2)
+            destination_file_metadata_log = MetadataLog(
+                maxsize, initial_cfg["spill_compression"],
+                initial_cfg.get("dst_root"), label="dstfiles",
+            )
+        destination_metadata_log = MetadataLog(
+            maxsize, initial_cfg["spill_compression"],
+            initial_cfg.get("dst_root"), label="dstdirs",
         )
-    )
-    if needs_directory_times:
-        global directory_times_log
-        maxsize = int(initial_cfg["directory_times_maxsize"])
-        directory_times_log = DirectoryTimesLog(
-            maxsize,
-            initial_cfg["spill_compression"],
-            initial_cfg.get("dst_root"),
-        )
+        guard = DestinationGuard(initial_cfg)
+        destination_guard = guard
+        try:
+            guard.start()
+        except Exception as exc:
+            destination_guard = None
+            guard.close()
+            log(f"cannot prepare the destination: {exc}")
+            return 1
         log(
-            f"directory timestamps: recorded in memory, compression="
+            f"destination metadata: recorded in memory, compression="
             f"{initial_cfg['spill_compression']}, spilled above "
-            f"{human_bytes(maxsize)} of compressed data"
+            f"{human_bytes(int(initial_cfg['metadata_maxsize']))} of "
+            f"compressed data"
         )
 
     resize_workers(initial_cfg["max_workers"])
@@ -12957,15 +14917,22 @@ def main() -> int:
             worker_list = list(workers)
 
         for t in worker_list:
-            t.join(timeout=30.0)
+            t.join(timeout=WORKER_JOIN_TIMEOUT_SEC)
 
         # Results produced while the workers were finishing arrive after the
         # scheduler loop has returned. Without this they would neither be
         # printed nor counted.
         emit_results(run_stats)
 
-        # Nothing can append any more; flush whatever is still buffered.
-        finalize_directory_times(apply_repair=False)
+        # Normally already done by the scheduler. Reached with the guard still
+        # set only when the scheduler did not get that far - an exception.
+        # The restore is safe only if every worker is gone; otherwise the
+        # tree stays locked and the journal is kept for the next start.
+        with workers_lock:
+            writers_gone = not any(t.is_alive() for t in workers)
+        finalize_destination_metadata(
+            apply_restore=writers_gone, run_stats=run_stats
+        )
 
         final_cfg = get_config_snapshot()
         configured_rest = final_cfg.get("remaining_tasks_file")
@@ -13050,11 +15017,34 @@ def main() -> int:
             f"{run_stats.get('failed_batch_count', 0)} failed batches"
         )
         return 1
+
+    # After the failed-path check on purpose: when a run both failed paths and
+    # cannot account for every record, the failure count is what the operator
+    # acts on. This one catches the case where nothing failed and the numbers
+    # still do not add up, which is the more unsettling of the two.
+    if not run_stats.get("path_accounting_balanced", True):
+        log(
+            f"exit status 1: the run cannot account for every input record "
+            f"({run_stats.get('accounted_path_count')} accounted against "
+            f"{run_stats.get('total_input_record_count')} accepted)"
+        )
+        return 1
+    if metadata_restore_incomplete.is_set():
+        log(
+            "exit status 1: destination metadata could not be fully recorded "
+            "or restored"
+        )
+        return 1
+    protection = run_stats.get("destination_protection_summary") or {}
     if (
-        directory_times_incomplete.is_set()
-        and not directory_times_deferred_by_stop.is_set()
+        get_config_snapshot().get("require_destination_protection", False)
+        and protection.get("destination_protection") not in (None, "enforced")
     ):
-        log("exit status 1: directory timestamps could not be fully restored")
+        log(
+            f"exit status 1: require_destination_protection is set and the "
+            f"destination was protected only "
+            f"{protection.get('destination_protection')!r}"
+        )
         return 1
     if sync_failed_event.is_set():
         log("exit status 1: the destination filesystem could not be flushed")
@@ -13075,10 +15065,7 @@ def main() -> int:
     # on - after a pause, or when the schedule opened again - they were
     # processed. Counting the interruption itself made a paused run that
     # afterwards copied everything report exit 2.
-    if (
-        run_stats.get("unstarted_path_count")
-        or directory_times_deferred_by_stop.is_set()
-    ):
+    if run_stats.get("unstarted_path_count"):
         # Queued paths that were never started produce no batch result at all,
         # so without this a run stopped before its first batch was dispatched
         # would report nothing but successes.
@@ -13086,12 +15073,7 @@ def main() -> int:
             "exit status 2: run stopped before all work was processed "
             f"({run_stats.get('unstarted_path_count', 0)} paths were never "
             f"started; {run_stats.get('stopped_batch_count', 0)} batches were "
-            f"cut short"
-            + (
-                "; directory timestamps were not applied"
-                if directory_times_deferred_by_stop.is_set() else ""
-            )
-            + ")"
+            f"cut short)"
         )
         return 2
     return 0
