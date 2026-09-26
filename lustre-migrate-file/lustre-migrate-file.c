@@ -41,7 +41,7 @@
 #include <lustre/lustreapi.h>
 
 #define PROGRAM_NAME    "lustre-migrate-file"
-#define PROGRAM_VERSION "2.5"
+#define PROGRAM_VERSION "2.6"
 
 /* Version of the JSON record this program writes. A consumer checks it before
  * reading any other field, so a future incompatible change is refused rather
@@ -537,13 +537,28 @@ static int resolve_path(const struct options *opt, struct resolved *out)
 			 */
 			access_mode = (opt->inspect_only || opt->dry_run)
 				? O_RDONLY : O_RDWR;
+			/*
+			 * O_NONBLOCK in BOTH attempts. Without it, opening a
+			 * FIFO for reading blocks until a writer appears, and
+			 * the type check further down - the thing that would
+			 * reject a FIFO - is never reached. --inspect-only and
+			 * --dry-run use O_RDONLY and hung outright in a test.
+			 * (O_RDWR on a FIFO does not block on Linux, so the
+			 * migrating path was not affected; the flag belongs in
+			 * both anyway, because which mode is used is decided
+			 * one line above and may change.)
+			 *
+			 * On a regular file - the only type that survives the
+			 * check - O_NONBLOCK has no effect on reads.
+			 */
 			file_fd = openat(leaf_parent_fd, component,
 					 access_mode | O_NOATIME | O_FILE_ENC |
-					 O_NOFOLLOW | O_CLOEXEC);
+					 O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
 			if (file_fd < 0 && errno == EPERM)
 				file_fd = openat(leaf_parent_fd, component,
 						 access_mode | O_FILE_ENC |
-						 O_NOFOLLOW | O_CLOEXEC);
+						 O_NOFOLLOW | O_NONBLOCK |
+						 O_CLOEXEC);
 			if (file_fd < 0) {
 				set_error("resolve", "cannot open %s: %s",
 					  opt->path, strerror(errno));
@@ -2148,8 +2163,14 @@ static int open_direct_twin(struct resolved *r)
 	struct stat direct_st;
 	int fd;
 
+	/* O_NONBLOCK for the same reason as in resolve_path(): this reopens a
+	 * name, and whatever it names is only judged after the open. O_RDWR on
+	 * a FIFO happens not to block on Linux, so this one was not the hang
+	 * that was reported - but relying on that exception is a worse rule
+	 * than "every open of a caller-supplied leaf carries O_NONBLOCK". */
 	fd = openat(r->parent_fd, r->leaf,
-		    O_RDWR | O_DIRECT | O_NOFOLLOW | O_CLOEXEC | O_FILE_ENC);
+		    O_RDWR | O_DIRECT | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC |
+		    O_FILE_ENC);
 	if (fd < 0) {
 		set_error("resync",
 			  "cannot reopen the file with O_DIRECT for resync: %s",
