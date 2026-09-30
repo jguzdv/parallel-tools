@@ -4965,18 +4965,25 @@ def prepare_destination_directory(
                 os.fchmod(fd, 0o777 & ~get_process_umask())
             return fd, created
 
+        record_cfg = cfg if cfg is not None else get_config_snapshot()
+        if created:
+            # Before anything that can fail, and whatever the once-marker
+            # below says: nobody but this contact will ever know it is new.
+            record_created_directory(rel_b, record_cfg)
         locked = guard.lock_directory(fd, rel_b)
-        # Once per directory and run. Every walk passes the whole parent
-        # chain, and recording each component on each pass made a tree 1000
-        # levels deep write close to a million records - each with its full
-        # path - for a few thousand files. The values would be the same each
-        # time; the first record is the one that is needed.
-        if guard.first_contact(os.fstat(fd)):
-            record_directory_final(
-                rel_b, src_st, src_fd,
-                cfg if cfg is not None else get_config_snapshot(),
-                created, locked,
-            )
+        # The source values once per directory and run. Every walk passes the
+        # whole parent chain, and recording each component on each pass made
+        # a tree 1000 levels deep write close to a million records - each
+        # with its full path - for a few thousand files.
+        #
+        # Marked only AFTER the record is in the log. Marking first lost the
+        # directory for good when the source read failed: every later contact
+        # - the retry included - found it marked and skipped it. Two workers
+        # recording at the same time only write it twice, which is harmless.
+        dir_st = os.fstat(fd)
+        if not guard.already_recorded(dir_st):
+            if record_directory_final(rel_b, src_st, src_fd, record_cfg, locked):
+                guard.note_recorded(dir_st)
         # Only fsync="file" pays for durability of a directory entry.
         if created and cfg is not None and fsync_per_file(cfg):
             try:
@@ -6038,16 +6045,23 @@ class DestinationGuard:
             "destination_journal_available": self.journal_problem is None,
         }
 
-    def first_contact(self, st) -> bool:
-        """True the first time this run records a given directory."""
-        key = (int(st.st_dev) << 64) | int(st.st_ino)
+    @staticmethod
+    def _identity_key(st) -> int:
+        return (int(st.st_dev) << 64) | int(st.st_ino)
+
+    def already_recorded(self, st) -> bool:
+        """Whether this run has the source record of this directory already."""
+        key = self._identity_key(st)
         with self.lock:
-            if key in self.recorded_identities:
-                return False
+            return key in self.recorded_identities
+
+    def note_recorded(self, st) -> None:
+        """Called only once the record is actually in the log."""
+        key = self._identity_key(st)
+        with self.lock:
             if len(self.recorded_identities) >= RECORDED_DIRECTORY_CACHE:
                 self.recorded_identities.clear()
             self.recorded_identities.add(key)
-            return True
 
     def note_unlocked(self, rel_b: bytes, reason: str) -> None:
         with self.lock:
@@ -6532,7 +6546,13 @@ def _source_xattr_fields(listxattr, getxattr, is_directory: bool) -> dict:
     return fields
 
 
-def directory_final_fields(src_st, src_fd: Optional[int], cfg: dict, created: bool) -> dict:
+def directory_final_fields(src_st, src_fd: Optional[int], cfg: dict) -> dict:
+    """The final values a destination directory takes from its source.
+
+    What a directory gets because this run CREATED it is not here: only the
+    contact that created it knows that, and it is recorded at that moment by
+    record_created_directory() - see there.
+    """
     fields = {}
     if permissions_owner(cfg):
         fields["uid"] = int(src_st.st_uid)
@@ -6540,10 +6560,6 @@ def directory_final_fields(src_st, src_fd: Optional[int], cfg: dict, created: bo
         fields["gid"] = int(src_st.st_gid)
     if permissions_mode(cfg):
         fields["mode"] = stat.S_IMODE(src_st.st_mode)
-    elif created:
-        # No mode class: a directory this run created gets what mkdir would
-        # have given it, fixed now, while it is known to be new.
-        fields["mode"] = 0o777 & ~get_process_umask()
     if cfg.get("xattr", False) and src_fd is not None:
         try:
             fields.update(_source_xattr_fields(
@@ -6566,16 +6582,51 @@ def record_directory_final(
     src_st,
     src_fd: Optional[int],
     cfg: dict,
-    created: bool,
     locked: bool,
-) -> None:
-    """Note what one destination directory must look like at the end."""
+) -> bool:
+    """Note what one destination directory must look like at the end.
+
+    Returns True only when the record is in the log. Reading the source can
+    raise; that is left to the caller's error handling, and nothing counts as
+    recorded then.
+    """
+    log_object = destination_metadata_log
+    if log_object is None:
+        return False
+    fields = directory_final_fields(src_st, src_fd, cfg)
+    if locked:
+        fields["locked"] = True
+    try:
+        log_object.record_entry(rel_b or b".", META_KIND_DIR, META_ORIGIN_FINAL, fields)
+    except Exception as exc:
+        note_metadata_record_failure(exc)
+        return False
+    return True
+
+
+def record_created_directory(rel_b: bytes, cfg: dict, locked: bool = False) -> None:
+    """Note the final mode of a directory this run has just created.
+
+    Only the contact that created a directory knows it is new, and nobody can
+    learn it later: a retry, or another worker, finds it existing. So this is
+    recorded at once, from nothing but the configuration - no source read
+    that could fail - and separately from the once-per-directory source
+    record. The restore merges the two field by field, in whatever order
+    they were written.
+
+    Without the mode class a new directory ends with what mkdir would have
+    given it; with it, the source record carries the mode.
+    """
     log_object = destination_metadata_log
     if log_object is None:
         return
-    fields = directory_final_fields(src_st, src_fd, cfg, created)
+    fields = {}
+    if not permissions_mode(cfg):
+        fields["mode"] = 0o777 & ~get_process_umask()
     if locked:
         fields["locked"] = True
+    if not fields:
+        return
     try:
         log_object.record_entry(rel_b or b".", META_KIND_DIR, META_ORIGIN_FINAL, fields)
     except Exception as exc:
@@ -6583,16 +6634,7 @@ def record_directory_final(
 
 
 def record_created_root(cfg: dict) -> None:
-    log_object = destination_metadata_log
-    if log_object is None or permissions_mode(cfg):
-        return
-    try:
-        log_object.record_entry(
-            b".", META_KIND_DIR, META_ORIGIN_FINAL,
-            {"mode": 0o777 & ~get_process_umask(), "locked": True},
-        )
-    except Exception as exc:
-        note_metadata_record_failure(exc)
+    record_created_directory(b".", cfg, locked=True)
 
 
 def record_root_final(cfg: dict) -> None:
@@ -6602,7 +6644,7 @@ def record_root_final(cfg: dict) -> None:
     src_fd = open_dir_fd_componentwise(os.fsencode(cfg["src_root"]), create=False)
     try:
         record_directory_final(
-            b".", os.fstat(src_fd), src_fd, cfg, created=False,
+            b".", os.fstat(src_fd), src_fd, cfg,
             locked=destination_guard is not None
             and destination_guard.root_problem is None,
         )
