@@ -77,6 +77,13 @@ Without `/proc` the tool still runs, and says once per run which of these it
 had to drop. It is not a supported configuration — it is what happens on a
 developer's macOS machine.
 
+**Open file limit.** At start the soft `RLIMIT_NOFILE` is raised to the hard
+limit, and the log says so. Each worker holds a few dozen directory
+descriptors at a time; however deep the tree, the number stays bounded, but
+32 workers already come close to the common soft default of 1024. When the
+hard limit itself is that low, raise it (`ulimit -Hn`, `limits.conf`,
+`LimitNOFILE=` for a service) rather than running with fewer workers.
+
 ### External programs
 
 | program | needed for | from |

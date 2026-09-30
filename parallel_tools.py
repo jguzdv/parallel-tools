@@ -26,6 +26,7 @@ import zlib
 import gzip
 import heapq
 import fcntl
+import resource
 from collections import deque, OrderedDict
 
 try:
@@ -296,6 +297,37 @@ active_tasks = 0          # Anzahl aktuell laufender Worker-Jobs
 # ------------------------------------------------------------
 # Hilfsfunktionen
 # ------------------------------------------------------------
+
+def raise_open_file_limit() -> None:
+    """Lift the soft RLIMIT_NOFILE to the hard limit.
+
+    Every worker holds a handful of directory descriptors at once - the
+    parent cache alone keeps up to 32 per worker - and rsync or an external
+    engine adds its own. A default soft limit of 1024 is reached by 32
+    workers without anything going wrong, and then every open() of every
+    worker fails with EMFILE. The hard limit is what the administrator
+    allows; the soft default is only a convention.
+    """
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError):
+        return
+    target = hard
+    if hard == resource.RLIM_INFINITY:
+        # The kernel refuses "unlimited" for descriptors; fs.nr_open caps it.
+        try:
+            with open("/proc/sys/fs/nr_open") as fp:
+                target = int(fp.read().strip())
+        except (OSError, ValueError):
+            target = 1 << 20
+    if soft != resource.RLIM_INFINITY and soft >= target:
+        return
+    try:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        log(f"open file limit raised: soft {soft} -> {target} (hard {hard})")
+    except (OSError, ValueError) as exc:
+        log(f"WARNING: cannot raise the open file limit from {soft}: {exc}")
+
 
 def log(msg: str) -> None:
     """Write one operational line to stderr, timestamped.
@@ -4890,33 +4922,39 @@ def prepare_destination_directory(
 
     Returns (fd, created). The caller owns the descriptor.
     """
+    # Open first, create only what is missing. mkdir takes the parent's inode
+    # lock exclusively even when the name exists, and every worker walks the
+    # same parent chains: trying mkdir on each level first serialised all of
+    # them on every shared directory - measured on a tree 1180 levels deep,
+    # 8 workers took 167 s for what one worker did in 19 s. A plain lookup
+    # of an existing directory takes no such lock.
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC
     created = False
-    dst_st = None
+    fd = None
+    for _attempt in range(3):
+        try:
+            fd = os.open(name_b, flags, dir_fd=dst_parent_fd)
+            break
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            if exc.errno in (errno.ENOTDIR, errno.ELOOP):
+                # A file, or a symlink: O_NOFOLLOW refuses to follow it.
+                raise NotADirectoryError(
+                    errno.ENOTDIR,
+                    f"destination path component is not a directory: "
+                    f"{path_display(name_b)}",
+                ) from exc
+            raise
+        try:
+            os.mkdir(name_b, DESTINATION_LOCK_PERMISSIONS, dir_fd=dst_parent_fd)
+            created = True
+        except FileExistsError:
+            # Another worker created it in between; open that one.
+            continue
+    if fd is None:
+        fd = os.open(name_b, flags, dir_fd=dst_parent_fd)
     try:
-        os.mkdir(name_b, DESTINATION_LOCK_PERMISSIONS, dir_fd=dst_parent_fd)
-        created = True
-    except FileExistsError:
-        dst_st = os.stat(name_b, dir_fd=dst_parent_fd, follow_symlinks=False)
-        if not stat.S_ISDIR(dst_st.st_mode):
-            raise NotADirectoryError(
-                errno.ENOTDIR,
-                f"destination path component is not a directory: "
-                f"{path_display(name_b)}",
-            )
-
-    fd = os.open(
-        name_b,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
-        dir_fd=dst_parent_fd,
-    )
-    try:
-        if dst_st is not None:
-            opened = os.fstat(fd)
-            if (opened.st_dev, opened.st_ino) != (dst_st.st_dev, dst_st.st_ino):
-                raise OSError(
-                    errno.ESTALE, "destination directory changed while opening it"
-                )
-
         guard = destination_guard
         if guard is None:
             # Nothing guards this tree (a caller outside a copy or rsync run):
@@ -4928,10 +4966,17 @@ def prepare_destination_directory(
             return fd, created
 
         locked = guard.lock_directory(fd, rel_b)
-        record_directory_final(
-            rel_b, src_st, src_fd, cfg if cfg is not None else get_config_snapshot(),
-            created, locked,
-        )
+        # Once per directory and run. Every walk passes the whole parent
+        # chain, and recording each component on each pass made a tree 1000
+        # levels deep write close to a million records - each with its full
+        # path - for a few thousand files. The values would be the same each
+        # time; the first record is the one that is needed.
+        if guard.first_contact(os.fstat(fd)):
+            record_directory_final(
+                rel_b, src_st, src_fd,
+                cfg if cfg is not None else get_config_snapshot(),
+                created, locked,
+            )
         # Only fsync="file" pays for durability of a directory entry.
         if created and cfg is not None and fsync_per_file(cfg):
             try:
@@ -5962,6 +6007,10 @@ class DestinationGuard:
         self.violation_count = 0
         self.journal = DestinationJournal(self.dst_root_b)
         self.journal_problem: Optional[str] = None
+        # Directories already recorded in this run, as dev<<64|ino integers.
+        # Bounded: when full it is emptied, and a directory met again after
+        # that is recorded a second time - harmless, the restore merges it.
+        self.recorded_identities = set()
 
     # -- state ---------------------------------------------------------
 
@@ -5988,6 +6037,17 @@ class DestinationGuard:
             "destination_parent_chain_problem": self.chain_problem,
             "destination_journal_available": self.journal_problem is None,
         }
+
+    def first_contact(self, st) -> bool:
+        """True the first time this run records a given directory."""
+        key = (int(st.st_dev) << 64) | int(st.st_ino)
+        with self.lock:
+            if key in self.recorded_identities:
+                return False
+            if len(self.recorded_identities) >= RECORDED_DIRECTORY_CACHE:
+                self.recorded_identities.clear()
+            self.recorded_identities.add(key)
+            return True
 
     def note_unlocked(self, rel_b: bytes, reason: str) -> None:
         with self.lock:
@@ -6346,51 +6406,94 @@ class DestinationGuard:
         the first missing one; new directories are created locked anyway.
         The walk that later hands out the parent descriptors finds these
         locked and has nothing left to journal.
+
+        The number of descriptors held stays bounded whatever the depth:
+        the walk holds one, and directories waiting to be locked are handed
+        to lock_directories() in groups of PRELOCK_GROUP. Holding every
+        level of every chain at once ran a tree 1000+ levels deep into
+        EMFILE - for all workers, since the limit is per process. Chains are
+        walked in sorted order, and a chain that continues the previous one
+        carries on from where that one ended instead of from dst_root.
         """
-        opened = {}
-        items = []
-        try:
-            for rel_b in sorted(set(rel_dirs), key=lambda r: (r.count(b"/"), r)):
-                if not rel_b or rel_b == b".":
-                    continue
-                parts = rel_b.split(b"/")
-                parent_fd = self.root_fd
-                walked = b""
-                for part in parts:
-                    walked = os.path.join(walked, part) if walked else part
-                    fd = opened.get(walked)
-                    if fd is None:
-                        if walked in opened:
-                            break
-                        try:
-                            fd = os.open(
-                                part,
-                                os.O_RDONLY | os.O_DIRECTORY
-                                | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
-                                dir_fd=parent_fd,
-                            )
-                        except OSError:
-                            # Missing, not a directory or a symlink: the
-                            # ordinary walk creates it or reports it.
-                            opened[walked] = None
-                            break
-                        opened[walked] = fd
-                        items.append((fd, walked))
-                    parent_fd = fd
-            if items:
-                self.lock_directories(items)
-        finally:
-            for fd in opened.values():
-                if fd is not None:
+        pending = []
+        seen = set()
+        walk_fd = -1
+        walk_rel = None
+
+        def flush() -> None:
+            try:
+                if pending:
+                    self.lock_directories(pending)
+            finally:
+                for fd, _rel in pending:
                     try:
                         os.close(fd)
                     except OSError:
                         pass
+                pending.clear()
+
+        try:
+            for rel_b in sorted(set(rel_dirs)):
+                if not rel_b or rel_b == b".":
+                    continue
+                if walk_rel is not None and rel_b.startswith(walk_rel + b"/"):
+                    parts = rel_b[len(walk_rel) + 1:].split(b"/")
+                    walked = walk_rel
+                else:
+                    if walk_fd >= 0:
+                        os.close(walk_fd)
+                    walk_fd = os.dup(self.root_fd)
+                    parts = rel_b.split(b"/")
+                    walked = b""
+                walk_rel = walked or None
+                for part in parts:
+                    try:
+                        next_fd = os.open(
+                            part,
+                            os.O_RDONLY | os.O_DIRECTORY
+                            | getattr(os, "O_NOFOLLOW", 0) | os.O_CLOEXEC,
+                            dir_fd=walk_fd,
+                        )
+                    except OSError:
+                        # Missing, not a directory or a symlink: the ordinary
+                        # walk creates it or reports it.
+                        break
+                    os.close(walk_fd)
+                    walk_fd = next_fd
+                    walked = os.path.join(walked, part) if walked else part
+                    walk_rel = walked
+                    st = os.fstat(walk_fd)
+                    identity = (int(st.st_dev), int(st.st_ino))
+                    if identity in seen or self.is_locked_state(st):
+                        continue
+                    seen.add(identity)
+                    pending.append((os.dup(walk_fd), walked))
+                    if len(pending) >= PRELOCK_GROUP:
+                        flush()
+                if walk_rel is None:
+                    # Nothing of this chain exists; the next one starts over.
+                    os.close(walk_fd)
+                    walk_fd = -1
+            flush()
+        finally:
+            for fd, _rel in pending:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if walk_fd >= 0:
+                os.close(walk_fd)
 
 
 destination_guard: Optional[DestinationGuard] = None
 # A guard whose run lock must outlive the run: kept referenced, never closed.
 _abandoned_guard: Optional[DestinationGuard] = None
+# How many directory identities a run remembers as already recorded (about
+# 60 bytes each). Beyond it a directory may be recorded twice, never not at all.
+RECORDED_DIRECTORY_CACHE = 1 << 20
+# Directories one prelock hands to lock_directories() at a time: one journal
+# flush per group, and at most this many descriptors held for it per worker.
+PRELOCK_GROUP = 32
 # How long the shutdown waits for each worker thread before it gives up on
 # restoring the destination and leaves the tree locked instead.
 WORKER_JOIN_TIMEOUT_SEC = 30.0
@@ -8743,14 +8846,23 @@ def _run_rsync_batch(
             # the source chain componentwise itself, so it needs no pre-check.
             internal_long_paths.append((src_b, src_abs_b, dst_b))
         else:
-            parent_error = source_parent_error(os.path.dirname(rel_b))
-            if parent_error:
-                input_errors[src_abs_b] = parent_error
-                continue
-            destination_error = prepare_destination(rel_b)
-            if destination_error:
-                input_errors[src_abs_b] = destination_error
-                continue
+            if destination_guard is not None:
+                # The destination walk opens the source chain as well, with
+                # O_NOFOLLOW on every component below src_root, so it is the
+                # symlink check too. Only when it fails is the chain walked a
+                # second time, to say which of the source causes it was.
+                destination_error = prepare_destination(rel_b)
+                if destination_error:
+                    input_errors[src_abs_b] = (
+                        source_parent_error(os.path.dirname(rel_b))
+                        or destination_error
+                    )
+                    continue
+            else:
+                parent_error = source_parent_error(os.path.dirname(rel_b))
+                if parent_error:
+                    input_errors[src_abs_b] = parent_error
+                    continue
             # max_path_length="rsync": delegate even technically long paths to
             # rsync unchanged.  Numeric max_path_length also reaches this path
             # after the explicit policy limit check and intentionally gets no
@@ -14790,6 +14902,8 @@ def main() -> int:
     except Exception as e:
         log(f"external program check failed: {e}")
         return 1
+
+    raise_open_file_limit()
 
     global config
     with config_lock:
